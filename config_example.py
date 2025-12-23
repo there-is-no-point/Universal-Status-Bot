@@ -1,6 +1,6 @@
 # Токен от @BotFather
-TG_BOT_TOKEN = "7741244033:AAHE0vAI_AHE2LiLX45tho6QwsQvu4qHrgk"
+TG_BOT_TOKEN = "77......."
 # Твой ID от @userinfobot
-TG_USER_ID = "686194794"
+TG_USER_ID = "12345678"
 # Ссылка на базу Upstash
-REDIS_URL="rediss://default:AYCZAAIncDE4NjgzYzcwMjU0NGE0ZjBmYTBjMGFiN2I3OTE4YzhlM3AxMzI5MjE@careful-anteater-32921.upstash.io:6379"
+REDIS_URL="rediss://default:......"
