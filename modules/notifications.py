@@ -91,7 +91,8 @@ class BotLink:
         data = {
             "status": "Working 🟢",
             "current_account": getattr(c, 'address', 'Unknown'),
-            "last_updated": datetime.now().strftime("%H:%M:%S"),
+            # 👇 ГЛАВНОЕ ИЗМЕНЕНИЕ: Отправляем Unix Timestamp
+            "last_updated": time.time(),
             "pos_current": getattr(c, 'position', 0),
             "pos_total": getattr(c, 'total_accounts', 0),
         }

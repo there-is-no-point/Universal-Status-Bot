@@ -2,6 +2,7 @@ import json
 import threading
 import requests
 import redis
+import time  # 👈 Добавлен импорт времени
 from datetime import datetime
 import sys
 import os
@@ -77,7 +78,9 @@ class StatusManager:
             # Если имя не задано, используем Unknown
             device_name = getattr(config, 'DEVICE_NAME', 'Unknown_Device')
 
-            data["last_updated"] = datetime.now().strftime("%H:%M:%S")
+            # 👇 ГЛАВНОЕ ИЗМЕНЕНИЕ: Отправляем Unix Timestamp (число)
+            data["last_updated"] = time.time()
+
             data_str = json.dumps(data, ensure_ascii=False)
 
             self._redis.hset(f"status:{project_name}", device_name, data_str)

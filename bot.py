@@ -3,6 +3,7 @@ import json
 import redis
 import re
 import io
+import time
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
@@ -17,7 +18,8 @@ dp = Dispatcher()
 
 # Подключение к Redis
 try:
-    r = redis.Redis.from_url(config.REDIS_URL, decode_responses=True)
+    # SSL Fix для бота (важно, если бот на Windows)
+    r = redis.Redis.from_url(config.REDIS_URL, decode_responses=True, ssl_cert_reqs=None)
     r.ping()
     print("✅ Бот успешно подключен к Redis")
 except Exception as e:
@@ -110,20 +112,46 @@ def make_progress_bar(current, total, length=10):
     return '■' * filled + '□' * (length - filled)
 
 
-def calculate_time_ago(time_str: str) -> str:
+# 👇 НОВАЯ УМНАЯ ФУНКЦИЯ ВРЕМЕНИ
+def format_time_data(raw_time):
+    """
+    Принимает: timestamp (float) ИЛИ старый формат строки (str)
+    Возвращает кортеж: (Красивое время, Текст '5 мин назад')
+    """
     try:
         now = datetime.now()
-        if len(time_str) <= 8:
-            dt = datetime.strptime(time_str, "%H:%M:%S").replace(year=now.year, month=now.month, day=now.day)
-            if dt > now: dt -= timedelta(days=1)
+
+        # 1. Если пришло число (новый формат)
+        if isinstance(raw_time, (int, float)):
+            # fromtimestamp САМ конвертирует в локальное время устройства, где запущен бот
+            dt = datetime.fromtimestamp(raw_time)
+
+        # 2. Если пришла строка (старый формат, обратная совместимость)
         else:
-            dt = datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S")
-        m = int((now - dt).total_seconds() / 60)
-        if m < 1: return "(сейчас)"
-        if m >= 10: return f"(💀 {m} мин.)"
-        return f"({m} мин.)"
-    except:
-        return ""
+            if len(str(raw_time)) <= 8:
+                dt = datetime.strptime(raw_time, "%H:%M:%S").replace(year=now.year, month=now.month, day=now.day)
+            else:
+                dt = datetime.strptime(raw_time, "%Y-%m-%d %H:%M:%S")
+
+        # Считаем разницу
+        diff_seconds = (now - dt).total_seconds()
+        m = int(diff_seconds / 60)
+
+        time_str = dt.strftime("%H:%M:%S")
+
+        ago_str = ""
+        if m < 1:
+            ago_str = "(сейчас)"
+        elif m >= 10:
+            ago_str = f"(💀 {m} мин.)"
+        else:
+            ago_str = f"({m} мин.)"
+
+        return time_str, ago_str
+
+    except Exception:
+        # Если пришел мусор, просто отдаем как есть
+        return str(raw_time), ""
 
 
 async def safe_edit_text(callback: CallbackQuery, text: str, reply_markup=None):
@@ -156,13 +184,16 @@ async def render_device_page(callback: CallbackQuery, project_name: str, device_
 
     st = stats.get('status', 'Unknown')
     acc = stats.get('current_account', 'N/A')
-    last_upd = stats.get('last_updated', 'N/A')
+
+    # 👇 ИСПОЛЬЗУЕМ НОВУЮ ЛОГИКУ ВРЕМЕНИ
+    raw_last_upd = stats.get('last_updated', 0)
+    nice_time, time_ago = format_time_data(raw_last_upd)
+
     header_emoji = get_status_emoji(st)
-    time_ago = calculate_time_ago(last_upd)
 
     msg = f"🖥 <b>Worker:</b> {device_name}\n━━━━━━━━━━━━━━━━━━\n"
     msg += f"🔥 <b>STATUS:</b> {header_emoji} {st.upper()}\n"
-    msg += f"⏰ <b>Last Signal:</b> {last_upd} <i>{time_ago}</i>\n\n"
+    msg += f"⏰ <b>Last Signal:</b> {nice_time} <i>{time_ago}</i>\n\n"
 
     # IDENTITY
     if acc and len(acc) > 15 and " " not in acc:
@@ -185,10 +216,6 @@ async def render_device_page(callback: CallbackQuery, project_name: str, device_
         msg += f"📦 Total: {total} | ✅ {parsed['success']} | ❌ {parsed['fails']}\n\n"
 
     elif parsed and parsed['type'] == 'simple':
-        # 👇 ИСПРАВЛЕНИЕ:
-        # Если галочек нет (знаем только позицию), мы НЕ пишем "Processing: 4/10".
-        # Мы рисуем честный бар "0%" (раз не знаем сколько готово, считаем что 0).
-        # Это предотвращает скачки интерфейса.
         total = parsed['total']
         bar = make_progress_bar(0, total)
         msg += f"📊 <b>PROGRESS:</b>\n<code>[{bar}] 0%</code>\n"
