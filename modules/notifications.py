@@ -1,16 +1,21 @@
+import sys
+import os
+
+# 1. ЗАЩИТА ОТ ВЫЛЕТОВ (Segmentation Fault)
+# Обязательно должно быть ДО импорта redis!
+sys.modules['hiredis'] = None
+
 import redis
 import json
 import threading
 import time
-import os
-import sys
 from datetime import datetime
 
 # --- НАСТРОЙКИ ОТЛАДКИ ---
 DEBUG_MODE = False
 # -------------------------
 
-# 1. Windows Fix: Принудительно добавляем корень проекта
+# 2. Windows Fix: Принудительно добавляем корень проекта
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 if DEBUG_MODE:
