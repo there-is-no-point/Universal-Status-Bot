@@ -6,9 +6,35 @@ from datetime import datetime
 import sys
 import os
 
-# Пытаемся импортировать конфиг из корня проекта
+# --- НАСТРОЙКИ ОТЛАДКИ ---
+# Поставь True, если бот не запускается или не видит конфиг
+DEBUG_MODE = False
+# -------------------------
+
+# 1. Windows Fix: Принудительно добавляем корень проекта в пути
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import config
+
+if DEBUG_MODE:
+    print("\n" + "=" * 30)
+    print("📊 [DEBUG] STATUS MANAGER STARTUP")
+    print(f"📂 Module path: {os.path.dirname(os.path.abspath(__file__))}")
+
+try:
+    import config
+
+    if DEBUG_MODE:
+        print(f"✅ Config imported: {config}")
+        print(f"🔎 DEVICE_NAME: {getattr(config, 'DEVICE_NAME', '❌ MISSING')}")
+        print(f"🔎 REDIS_URL: {'✅ FOUND' if getattr(config, 'REDIS_URL', None) else '❌ MISSING'}")
+except ImportError as e:
+    print(f"❌ [StatusManager] CRITICAL: Config import failed! {e}")
+    config = None
+except Exception as e:
+    print(f"❌ [StatusManager] CRITICAL: Unexpected config error: {e}")
+    config = None
+
+if DEBUG_MODE:
+    print("=" * 30 + "\n")
 
 
 class StatusManager:
@@ -24,39 +50,49 @@ class StatusManager:
     def _init_redis(self):
         try:
             if hasattr(config, 'REDIS_URL') and config.REDIS_URL:
-                self._redis = redis.Redis.from_url(config.REDIS_URL, decode_responses=True)
+                # ssl_cert_reqs=None решает проблему SSL на Windows
+                self._redis = redis.Redis.from_url(
+                    config.REDIS_URL,
+                    decode_responses=True,
+                    ssl_cert_reqs=None
+                )
+                # Быстрая проверка соединения
+                self._redis.ping()
+                if DEBUG_MODE:
+                    print(f"✅ [StatusManager] Redis Connected!")
             else:
-                print("⚠️ [StatusManager] REDIS_URL не найден в config.py")
+                if DEBUG_MODE:
+                    print("⚠️ [StatusManager] REDIS_URL missing. Skipping.")
         except Exception as e:
-            print(f"⚠️ [StatusManager] Ошибка Redis: {e}")
+            print(f"⚠️ [StatusManager] Redis Connection Failed: {e}")
+            self._redis = None
 
     def update_status(self, project_name: str, data: dict):
         """
-        Отправляет данные в Облако.
-        project_name: Имя проекта (например "HackQuest")
-        data: Любые данные (статус, монеты, ошибки)
+        Отправляет статус в Redis.
         """
         if not self._redis: return
 
         try:
-            # Берем имя устройства из конфига или ставим дефолтное
+            # Если имя не задано, используем Unknown
             device_name = getattr(config, 'DEVICE_NAME', 'Unknown_Device')
 
             data["last_updated"] = datetime.now().strftime("%H:%M:%S")
             data_str = json.dumps(data, ensure_ascii=False)
 
-            # Пишем в Redis: ключ=status:HackQuest, поле=Server_1
             self._redis.hset(f"status:{project_name}", device_name, data_str)
-            # Живет 24 часа
-            self._redis.expire(f"status:{project_name}", 86400)
+            self._redis.expire(f"status:{project_name}", 86400)  # TTL 24h
 
-        except Exception:
-            pass  # Тихо игнорируем ошибки, чтобы не ломать софт
+            if DEBUG_MODE:
+                print(f"📤 [DEBUG] Status sent for {device_name}")
+
+        except Exception as e:
+            if DEBUG_MODE:
+                print(f"❌ [StatusManager] Redis Write Error: {e}")
 
     def send_alert(self, text: str, status: str = "Info"):
         """
-        Прямая отправка в Telegram (для критических ошибок/финиша).
-        Требует TG_BOT_TOKEN в конфиге ПРОЕКТА.
+        Отправляет критические уведомления в TG (если включено).
         """
         if not getattr(config, 'USE_TG_BOT', False): return
 
