@@ -3,15 +3,16 @@ import threading
 import sys
 import os
 
+# 👇 1. ИМПОРТ НАШЕГО МОДУЛЯ СВЯЗИ
+from .notifications import bot_link
+
 # Пытаемся импортировать status_manager
-# Он НУЖЕН здесь, чтобы отправлять данные
 try:
     from .status_manager import status_manager
 except ImportError:
     from status_manager import status_manager
 
 # --- ГЛОБАЛЬНЫЕ СЧЕТЧИКИ ---
-# Теперь они живут здесь, а не в клиенте
 shared_success_count = 0
 shared_error_count = 0
 counter_lock = threading.Lock()
@@ -29,12 +30,15 @@ def get_progress_string(total_accounts):
 def monitor_account(project_name: str):
     """
     Декоратор. Вешается над process_account().
-    Сам считает статистику, ловит ошибки и шлет статусы.
     """
 
     def decorator(func):
         @functools.wraps(func)
         def wrapper(self, *args, **kwargs):
+            # 👇 2. ВНЕДРЕНИЕ: Передаем текущего клиента боту
+            # Теперь notifications.py имеет доступ к self.total_coins и др.
+            bot_link.register_client(self)
+
             # 1. ОТПРАВКА СТАТУСА "WORKING"
             progress_str = get_progress_string(self.total_accounts)
 
@@ -45,11 +49,10 @@ def monitor_account(project_name: str):
             })
 
             try:
-                # === ЗАПУСК ОСНОВНОЙ ЛОГИКИ СОФТА ===
+                # === ЗАПУСК ОСНОВНОЙ ЛОГИКИ ===
                 result = func(self, *args, **kwargs)
-                # ====================================
+                # ==============================
 
-                # Если софт вернул False, считаем это ошибкой
                 if result is False:
                     raise Exception("Process returned False")
 
@@ -66,11 +69,15 @@ def monitor_account(project_name: str):
                     "current_account": self.address
                 })
 
-                # Пуш об успехе
+                # Старый алерт (если был)
                 status_manager.send_alert(
                     f"✅ <b>{project_name}</b> | {self.address}\nStats: {final_progress}",
                     status="Success"
                 )
+
+                # 👇 3. НОВЫЙ АЛЕРТ В ТЕЛЕГРАМ БОТА
+                bot_link.send_notification("success",
+                                           f"Аккаунт {self.address[:6]}... завершен!\nСтатистика: {final_progress}")
 
                 return True
 
@@ -89,6 +96,10 @@ def monitor_account(project_name: str):
                 })
 
                 status_manager.send_alert(f"❌ <b>{project_name}</b> | {self.address}\nError: {e}", status="Error")
+
+                # 👇 4. НОВЫЙ АЛЕРТ ОБ ОШИБКЕ В ТЕЛЕГРАМ
+                bot_link.send_notification("error", f"Критическая ошибка на {self.address[:8]}:\n{str(e)}")
+
                 return False
 
         return wrapper

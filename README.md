@@ -121,7 +121,6 @@ TG_USER_ID = 123456789      # Твой ID
 # --- REDIS & DEVICE ---
 REDIS_URL = "rediss://default:..."  # Та же ссылка, что и у бота!
 WORKER_NAME = "Server 1"            # Уникальное имя этого ПК
-DEVICE_NAME = WORKER_NAME           # (Дублируем для совместимости)
 ```
 
 ### 4. Защита от крашей и Логи (`main.py`)
