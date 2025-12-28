@@ -8,6 +8,7 @@ import redis
 import json
 import threading
 import time
+import requests  # 👈 Добавляем для прямой отправки
 from datetime import datetime
 
 # --- НАСТРОЙКИ ОТЛАДКИ ---
@@ -43,6 +44,8 @@ class BotLink:
         self.inventory_callback = None
         self.running = False
         self.worker_name = getattr(config, 'WORKER_NAME', "Unknown_Worker")
+        # Имя проекта для настроек (пытаемся угадать или берем из конфига, если есть)
+        self.project_name = "UnknownProject"
 
         if self.redis_url:
             try:
@@ -63,15 +66,14 @@ class BotLink:
         if progress_callback: self.progress_callback = progress_callback
         if inventory_callback: self.inventory_callback = inventory_callback
 
-    # 👇 ОБНОВЛЕННАЯ ФУНКЦИЯ: Привязываем ошибки к worker_name
+        # Пытаемся определить имя проекта для фильтрации уведомлений
+        # Обычно мы узнаем его только в момент отправки, но сохраним на будущее
+        pass
+
     def report_error(self, project_name, wallet_address, error_text):
         if not self.running: return
         try:
-            # Используем ключи с именем воркера, чтобы разделить логи по устройствам
-            # SET для списка уникальных кошельков
             self.writer.sadd(f"failures:{project_name}:{self.worker_name}", wallet_address)
-
-            # HASH для хранения текста ошибки
             timestamp = datetime.now().strftime("%H:%M:%S")
             full_error = f"[{timestamp}] {error_text}"
             self.writer.hset(f"fail_logs:{project_name}:{self.worker_name}", wallet_address, full_error)
@@ -128,18 +130,69 @@ class BotLink:
             else:
                 text = f"❌ Log file not found at: {log_path}"
 
+            # Логи отправляем ТОЛЬКО через Redis (слишком сложно слать файлы напрямую без бота)
             self.writer.publish("telegram_alerts", json.dumps({
                 "type": "log_delivery", "project": "HackQuest", "worker": self.worker_name, "text": text
             }))
         except Exception as e:
             self.send_notification("error", f"Log Error: {e}")
 
-    def send_notification(self, type_, text):
+    # 👇 ГЛАВНОЕ ИЗМЕНЕНИЕ ЗДЕСЬ
+    def send_notification(self, type_, text, project_override=None):
         if not self.running: return
+
+        # Определяем имя проекта (обычно зашито жестко как "HackQuest" в вызовах старых,
+        # но лучше передавать динамически. Пока оставим HackQuest по умолчанию)
+        proj = project_override if project_override else "HackQuest"
+
         try:
-            self.writer.publish("telegram_alerts", json.dumps({
-                "type": type_, "project": "HackQuest", "worker": self.worker_name, "text": text
-            }))
+            # 1. ПРОВЕРКА НАСТРОЕК (ФИЛЬТР) ПРЯМО НА ИСТОЧНИКЕ
+            # Если глобальный мьют включен - выходим
+            if self.writer.get("settings:mute_all") == "1":
+                return
+            # Если проект заглушен - выходим
+            if self.writer.get(f"settings:mute:{proj}") == "1":
+                return
+
+            # 2. Формируем пакет
+            payload = {
+                "type": type_, "project": proj, "worker": self.worker_name, "text": text
+            }
+            json_data = json.dumps(payload)
+
+            # 3. ОТПРАВЛЯЕМ В REDIS И СМОТРИМ, КТО УСЛЫШАЛ
+            listeners_count = self.writer.publish("telegram_alerts", json_data)
+
+            # 4. ЕСЛИ listeners_count == 0, ЗНАЧИТ БОТ ВЫКЛЮЧЕН
+            # Включаем аварийную прямую отправку
+            if listeners_count == 0:
+                self._fallback_send_direct(type_, proj, text)
+
+        except Exception as e:
+            if DEBUG_MODE: print(f"Send error: {e}")
+
+    def _fallback_send_direct(self, type_, project, text):
+        """Отправляет сообщение напрямую в Telegram, если bot.py мертв"""
+        try:
+            token = getattr(config, 'TG_BOT_TOKEN', None)
+            uid = getattr(config, 'TG_USER_ID', None)
+            if not token or not uid: return
+
+            # Формируем такой же красивый текст, как делал bot.py
+            header = f"🤖 <b>{project}</b> | {self.worker_name}"
+
+            if type_ == "error":
+                msg = f"🔴 <b>ALARM (Direct):</b>\n{header}\n\n<pre>{text}</pre>"
+            elif type_ == "success":
+                msg = f"✅ <b>FINISHED (Direct):</b>\n{header}\n\n{text}"
+            else:
+                msg = f"ℹ️ <b>INFO (Direct):</b>\n{header}\n\n{text}"
+
+            requests.post(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                json={"chat_id": uid, "text": msg, "parse_mode": "HTML"},
+                timeout=5
+            )
         except:
             pass
 
