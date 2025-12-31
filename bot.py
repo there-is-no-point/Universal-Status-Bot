@@ -284,8 +284,12 @@ async def settings_notify_list(callback: CallbackQuery):
 
 
 @dp.callback_query(F.data.startswith("notify_edit_"))
-async def notify_edit_handler(callback: CallbackQuery):
-    target = callback.data.replace("notify_edit_", "")
+async def notify_edit_handler(callback: CallbackQuery, target_override=None):
+    if target_override:
+        target = target_override
+    else:
+        target = callback.data.replace("notify_edit_", "")
+
     builder = InlineKeyboardBuilder()
 
     def get_state(t):
@@ -322,10 +326,11 @@ async def notify_edit_handler(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("notify_set_"))
 async def notify_set_action(callback: CallbackQuery):
-    _, payload = callback.data.split("_", 2)
+    _, _, payload = callback.data.split("_", 2)
+
     target, t_code, val = payload.split("|")
     r.set(f"settings:notify:{target}:{t_code}", val)
-    await notify_edit_handler(callback)
+    await notify_edit_handler(callback, target_override=target)
 
 
 @dp.callback_query(F.data.startswith("notify_reset_"))
@@ -333,8 +338,7 @@ async def notify_reset_action(callback: CallbackQuery):
     target = callback.data.replace("notify_reset_", "")
     for t in ["success", "error", "log"]:
         r.delete(f"settings:notify:{target}:{t}")
-    callback.data = f"notify_edit_{target}"
-    await notify_edit_handler(callback)
+    await notify_edit_handler(callback, target_override=target)
 
 
 # --- Б. СОРТИРОВКА ---
@@ -348,8 +352,14 @@ async def settings_sorting_menu(callback: CallbackQuery):
 
 
 @dp.callback_query(F.data.startswith("sort_menu_"))
-async def render_sort_options(callback: CallbackQuery):
-    target = callback.data.split("_")[2]
+async def render_sort_options(callback: CallbackQuery, target_override=None):
+    # 👇 ИЗМЕНЕНИЕ: Если передали target явно (из сохранения), используем его.
+    # Иначе берем из нажатой кнопки.
+    if target_override:
+        target = target_override
+    else:
+        target = callback.data.split("_")[2]
+
     builder = InlineKeyboardBuilder()
     current = r.get(f"settings:sort_{target}")
     if not current: current = "scale" if target == "proj" else "priority"
@@ -372,12 +382,11 @@ async def render_sort_options(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("set_sort_"))
 async def save_sort_mode(callback: CallbackQuery):
-    _, payload = callback.data.split("_", 2)
+    _, _, payload = callback.data.split("_", 2)
     target, mode = payload.split("|")
     r.set(f"settings:sort_{target}", mode)
     await callback.answer("Сохранено!")
-    callback.data = f"sort_menu_{target}"
-    await render_sort_options(callback)
+    await render_sort_options(callback, target_override=target)
 
 
 # --- В. УПРАВЛЕНИЕ ДАННЫМИ (БЕЗОПАСНОЕ УДАЛЕНИЕ) ---
@@ -555,7 +564,7 @@ async def show_about(callback: CallbackQuery):
         "ℹ️ <b>О боте</b>\n\n"
         "<b>Universal Status Bot</b>\n"
         "Централизованная система мониторинга.\n"
-        "Предложения по улучлению присылайте сюда👇\n"
+        "Предложения по улучшению присылайте сюда👇\n"
     )
     builder = InlineKeyboardBuilder()
     #  ССЫЛКА НА GITHUB
