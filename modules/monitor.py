@@ -2,6 +2,7 @@ import functools
 import threading
 import sys
 import os
+import time
 
 from .notifications import bot_link
 from .stats_map import get_display_stats
@@ -18,15 +19,22 @@ shared_inventory = {}
 counter_lock = threading.Lock()
 
 
-def get_progress_string(total_accounts):
+def get_progress_data():
+    """Возвращает кортеж (успех, ошибки, всего_сделано)"""
     with counter_lock:
         succ = shared_success_count
         err = shared_error_count
         total_done = succ + err
+    return succ, err, total_done
+
+
+def get_progress_string(total_accounts):
+    succ, err, total_done = get_progress_data()
     return f"{total_done}/{total_accounts} (✅{succ} ❌{err})"
 
 
 def get_global_inventory():
+    """Возвращает копию словаря с СУММАРНЫМ лутом всех аккаунтов."""
     with counter_lock:
         return shared_inventory.copy()
 
@@ -44,12 +52,15 @@ def monitor_account(project_name: str):
 
             progress_str = get_progress_string(self.total_accounts)
 
-            # Шлем "Working" статус (тихо, только в Redis)
-            status_manager.update_status(project_name, {
+            # 1. ОТПРАВКА "WORKING" СТАТУСА ПРИ СТАРТЕ ПОТОКА
+            start_stats = {
                 "status": "Working 🟢",
                 "progress": progress_str,
-                "current_account": self.address
-            })
+                "current_account": self.address,
+                "last_updated": time.time()
+            }
+            start_stats.update(get_global_inventory())
+            status_manager.update_status(project_name, start_stats)
 
             try:
                 result = func(self, *args, **kwargs)
@@ -64,28 +75,37 @@ def monitor_account(project_name: str):
                     global shared_success_count
                     shared_success_count += 1
 
-                    # Суммируем в общий инвентарь
+                    # Суммируем лут
                     for key, value in current_stats.items():
                         if isinstance(value, (int, float)):
                             shared_inventory[key] = shared_inventory.get(key, 0) + value
 
-                final_progress = get_progress_string(self.total_accounts)
+                # Получаем свежие данные о прогрессе
+                succ, err, total_done = get_progress_data()
+                final_progress = f"{total_done}/{self.total_accounts} (✅{succ} ❌{err})"
 
-                # Обновляем статус в Redis (тихо)
-                status_data = {
-                    "status": "Sleeping 💤",
+                # 👇 ГЛАВНОЕ ИСПРАВЛЕНИЕ ЗДЕСЬ
+                # Если мы сделали меньше, чем всего аккаунтов - статус WORKING
+                # Если сделали всё (или больше, на всякий случай) - статус SLEEPING
+                if self.total_accounts > 0 and total_done < self.total_accounts:
+                    final_status = "Working 🟢"
+                else:
+                    final_status = "Sleeping 💤"
+
+                # 2. ОБНОВЛЕНИЕ СТАТУСА В REDIS
+                end_stats = {
+                    "status": final_status,  # <-- Используем умный статус
                     "progress": final_progress,
-                    "current_account": self.address
+                    "current_account": self.address,
+                    "last_updated": time.time()
                 }
-                status_data.update(current_stats)
-                status_manager.update_status(project_name, status_data)
+                end_stats.update(get_global_inventory())
+                status_manager.update_status(project_name, end_stats)
 
-                # 👇 ФОРМИРУЕМ ОДНО КРАСИВОЕ СООБЩЕНИЕ
-                # 1. Берем прогресс
+                # 3. УВЕДОМЛЕНИЕ (ЛОГ) ОСТАЕТСЯ БЕЗ ИЗМЕНЕНИЙ
                 msg = f"Аккаунт {self.address[:6]}... завершен!\n"
                 msg += f"📊 <b>Stats:</b> {final_progress}\n"
 
-                # 2. Добавляем инвентарь (Монеты, опыт и т.д.)
                 inventory_lines = []
                 for k, v in current_stats.items():
                     inventory_lines.append(f"• {k}: <b>{v}</b>")
@@ -93,8 +113,7 @@ def monitor_account(project_name: str):
                 if inventory_lines:
                     msg += "\n🎒 <b>Loot:</b>\n" + "\n".join(inventory_lines)
 
-                # 3. Отправляем ЕДИНСТВЕННОЕ уведомление
-                bot_link.send_notification("success", msg)
+                bot_link.send_notification("success", msg, project_override=project_name)
 
                 return True
 
@@ -104,17 +123,30 @@ def monitor_account(project_name: str):
                     global shared_error_count
                     shared_error_count += 1
 
+                # Получаем свежие данные
+                succ, err, total_done = get_progress_data()
+                error_progress = f"{total_done}/{self.total_accounts} (✅{succ} ❌{err})"
+
+                # 👇 ТУТ ТОЖЕ ИСПРАВЛЯЕМ
+                if self.total_accounts > 0 and total_done < self.total_accounts:
+                    final_status = "Working 🟢"  # Продолжаем работать, несмотря на ошибку
+                else:
+                    final_status = "Errors 🔴"  # Закончили с ошибками
+
                 bot_link.report_error(project_name, self.address, str(e))
-                error_progress = get_progress_string(self.total_accounts)
 
-                status_manager.update_status(project_name, {
-                    "status": "Error ❌",
+                error_stats = {
+                    "status": final_status,  # <-- Умный статус
                     "progress": error_progress,
-                    "current_account": self.address
-                })
+                    "current_account": self.address,
+                    "last_updated": time.time()
+                }
+                error_stats.update(get_global_inventory())
 
-                # Уведомление об ошибке тоже одно
-                bot_link.send_notification("error", f"Критическая ошибка на {self.address[:8]}:\n{str(e)}")
+                status_manager.update_status(project_name, error_stats)
+
+                bot_link.send_notification("error", f"Критическая ошибка на {self.address[:8]}:\n{str(e)}",
+                                           project_override=project_name)
 
                 return False
 
