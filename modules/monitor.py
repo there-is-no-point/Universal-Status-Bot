@@ -15,7 +15,31 @@ except ImportError:
 # --- ГЛОБАЛЬНЫЕ СЧЕТЧИКИ ---
 shared_success_count = 0
 shared_error_count = 0
+
+# 👇 ИЗМЕНЕНИЕ: Инициализация инвентаря нулями при старте
 shared_inventory = {}
+
+
+class DummyClient:
+    """Пустой класс-заглушка, чтобы узнать ключи из stats_map"""
+    pass
+
+
+try:
+    # 1. Создаем "пустого" клиента
+    _dummy = DummyClient()
+    # 2. Получаем шаблон статистики (вернет 0 для getattr(..., 0))
+    _initial_stats = get_display_stats(_dummy)
+
+    # 3. Заполняем глобальный инвентарь нулями
+    for k, v in _initial_stats.items():
+        # Берем только числа (игнорируем строки типа Twitter Username)
+        if isinstance(v, (int, float)):
+            shared_inventory[k] = 0
+except Exception:
+    # Если stats_map написан сложно и упал на заглушке - оставляем пустым
+    shared_inventory = {}
+
 counter_lock = threading.Lock()
 
 
@@ -44,7 +68,7 @@ def monitor_account(project_name: str):
         @functools.wraps(func)
         def wrapper(self, *args, **kwargs):
 
-            # 👇 1. ПЕРЕДАЕМ ИМЯ ПРОЕКТА ПРИ РЕГИСТРАЦИИ
+            # 1. ПЕРЕДАЕМ ИМЯ ПРОЕКТА ПРИ РЕГИСТРАЦИИ
             bot_link.register_client(
                 self,
                 project_name=project_name,
@@ -54,7 +78,7 @@ def monitor_account(project_name: str):
 
             progress_str = get_progress_string(self.total_accounts)
 
-            # Статус Working
+            # Статус Working (теперь уже с нулями в инвентаре!)
             start_stats = {
                 "status": "Working 🟢",
                 "progress": progress_str,
