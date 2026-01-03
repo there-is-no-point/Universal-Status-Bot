@@ -93,10 +93,14 @@ USE_TG_BOT = True           # Включить отправку в ТГ
 TG_BOT_TOKEN = "..."        # Тот же токен, что у бота
 TG_USER_ID = 123456789      # Ваш ID
 
-# --- REDIS & DEVICE ---
-REDIS_URL = "rediss://default:..."  # Та же ссылка на Upstash!
-WORKER_NAME = "Server 1"            # Уникальное имя для логов
-DEVICE_NAME = "Server 1"            # Имя кнопки в меню
+# --- ГЛАВНОЕ ДЛЯ МЕНЮ:
+REDIS_URL = "rediss://..." # Та же ссылка, что и у бота!
+# Имя проекта для декоратора
+PROJECT_NAME_FOR_BOT = "HackQuest"  # Или "TruthTensor", "Blum" и т.д.
+# Имя для БД Redis
+DEVICE_NAME = "Server-1"
+# Имя для логов и уведомлений
+WORKER_NAME = "Server-1"
 ```
 
 ### 4. Настройка `main.py` (Защита и Логи)
@@ -152,9 +156,8 @@ class MyClient:
         self.address = "0x..."
 
     # Оберните основную функцию работы декоратором
-    # Укажите имя проекта (оно будет заголовком в уведомлениях)
-    @monitor_account("MyProjectName") 
-    def start_work(self):
+    @monitor_account(config.PROJECT_NAME_FOR_BOT)  
+    def start_work(self): # Функция логики в вашем софте может называться как угодно
         # ... ваша логика ...
         
         # Важно: обновляйте self переменные по ходу работы!

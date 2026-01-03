@@ -44,15 +44,17 @@ def monitor_account(project_name: str):
         @functools.wraps(func)
         def wrapper(self, *args, **kwargs):
 
+            # 👇 1. ПЕРЕДАЕМ ИМЯ ПРОЕКТА ПРИ РЕГИСТРАЦИИ
             bot_link.register_client(
                 self,
+                project_name=project_name,
                 progress_callback=lambda: get_progress_string(self.total_accounts),
                 inventory_callback=get_global_inventory
             )
 
             progress_str = get_progress_string(self.total_accounts)
 
-            # 1. ОТПРАВКА "WORKING" СТАТУСА ПРИ СТАРТЕ ПОТОКА
+            # Статус Working
             start_stats = {
                 "status": "Working 🟢",
                 "progress": progress_str,
@@ -80,21 +82,17 @@ def monitor_account(project_name: str):
                         if isinstance(value, (int, float)):
                             shared_inventory[key] = shared_inventory.get(key, 0) + value
 
-                # Получаем свежие данные о прогрессе
                 succ, err, total_done = get_progress_data()
                 final_progress = f"{total_done}/{self.total_accounts} (✅{succ} ❌{err})"
 
-                # 👇 ГЛАВНОЕ ИСПРАВЛЕНИЕ ЗДЕСЬ
-                # Если мы сделали меньше, чем всего аккаунтов - статус WORKING
-                # Если сделали всё (или больше, на всякий случай) - статус SLEEPING
+                # Логика Sleeping/Working
                 if self.total_accounts > 0 and total_done < self.total_accounts:
                     final_status = "Working 🟢"
                 else:
                     final_status = "Sleeping 💤"
 
-                # 2. ОБНОВЛЕНИЕ СТАТУСА В REDIS
                 end_stats = {
-                    "status": final_status,  # <-- Используем умный статус
+                    "status": final_status,
                     "progress": final_progress,
                     "current_account": self.address,
                     "last_updated": time.time()
@@ -102,7 +100,7 @@ def monitor_account(project_name: str):
                 end_stats.update(get_global_inventory())
                 status_manager.update_status(project_name, end_stats)
 
-                # 3. УВЕДОМЛЕНИЕ (ЛОГ) ОСТАЕТСЯ БЕЗ ИЗМЕНЕНИЙ
+                # Уведомление
                 msg = f"Аккаунт {self.address[:6]}... завершен!\n"
                 msg += f"📊 <b>Stats:</b> {final_progress}\n"
 
@@ -123,20 +121,18 @@ def monitor_account(project_name: str):
                     global shared_error_count
                     shared_error_count += 1
 
-                # Получаем свежие данные
                 succ, err, total_done = get_progress_data()
                 error_progress = f"{total_done}/{self.total_accounts} (✅{succ} ❌{err})"
 
-                # 👇 ТУТ ТОЖЕ ИСПРАВЛЯЕМ
                 if self.total_accounts > 0 and total_done < self.total_accounts:
-                    final_status = "Working 🟢"  # Продолжаем работать, несмотря на ошибку
+                    final_status = "Working 🟢"
                 else:
-                    final_status = "Errors 🔴"  # Закончили с ошибками
+                    final_status = "Errors 🔴"
 
                 bot_link.report_error(project_name, self.address, str(e))
 
                 error_stats = {
-                    "status": final_status,  # <-- Умный статус
+                    "status": final_status,
                     "progress": error_progress,
                     "current_account": self.address,
                     "last_updated": time.time()

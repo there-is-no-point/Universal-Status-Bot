@@ -8,7 +8,7 @@ import redis
 import json
 import threading
 import time
-import requests  # 👈 Добавляем для прямой отправки
+import requests
 from datetime import datetime
 
 # --- НАСТРОЙКИ ОТЛАДКИ ---
@@ -44,7 +44,8 @@ class BotLink:
         self.inventory_callback = None
         self.running = False
         self.worker_name = getattr(config, 'WORKER_NAME', "Unknown_Worker")
-        # Имя проекта для настроек (пытаемся угадать или берем из конфига, если есть)
+
+        # 👇 2. ИМЯ ПРОЕКТА ДИНАМИЧЕСКОЕ (ПО УМОЛЧАНИЮ UNKNOWN)
         self.project_name = "UnknownProject"
 
         if self.redis_url:
@@ -52,23 +53,28 @@ class BotLink:
                 self.writer = redis.Redis.from_url(self.redis_url, decode_responses=True, ssl_cert_reqs=None)
                 self.reader = redis.Redis.from_url(self.redis_url, decode_responses=True, ssl_cert_reqs=None)
                 self.pubsub = self.reader.pubsub()
-
                 self.running = True
-                self.start_listener()
+                # Не запускаем listener здесь, ждем регистрации имени
             except Exception:
                 pass
 
         self._initialized = True
 
-    def register_client(self, client_instance, stats_callback=None, progress_callback=None, inventory_callback=None):
+    # 👇 3. ПРИНИМАЕМ ИМЯ ИЗ MONITOR.PY
+    def register_client(self, client_instance, project_name=None, stats_callback=None, progress_callback=None,
+                        inventory_callback=None):
         self.active_client = client_instance
+
+        if project_name:
+            self.project_name = project_name
+
         if stats_callback: self.stats_callback = stats_callback
         if progress_callback: self.progress_callback = progress_callback
         if inventory_callback: self.inventory_callback = inventory_callback
 
-        # Пытаемся определить имя проекта для фильтрации уведомлений
-        # Обычно мы узнаем его только в момент отправки, но сохраним на будущее
-        pass
+        # ЗАПУСКАЕМ СЛУШАТЕЛЯ ТОЛЬКО КОГДА УЗНАЛИ ИМЯ
+        if self.running and self.project_name != "UnknownProject":
+            self.start_listener()
 
     def report_error(self, project_name, wallet_address, error_text):
         if not self.running: return
@@ -124,47 +130,39 @@ class BotLink:
             if os.path.exists(log_path):
                 with open(log_path, "r", encoding="utf-8", errors='replace') as f:
                     f.seek(0, os.SEEK_END)
-                    seek_pos = max(0, f.tell() - 16384)
+                    seek_pos = max(0, f.tell() - 30000)
                     f.seek(seek_pos)
-                    text = f"📂 ...Last 16KB of app.log:\n\n" + f.read()
+                    text = f"📂 ...Last 30KB of app.log:\n\n" + f.read()
             else:
                 text = f"❌ Log file not found at: {log_path}"
 
-            # Логи отправляем ТОЛЬКО через Redis (слишком сложно слать файлы напрямую без бота)
             self.writer.publish("telegram_alerts", json.dumps({
-                "type": "log_delivery", "project": "HackQuest", "worker": self.worker_name, "text": text
+                "type": "log_delivery",
+                "project": self.project_name,
+                "worker": self.worker_name,
+                "text": text
             }))
         except Exception as e:
             self.send_notification("error", f"Log Error: {e}")
 
-    # 👇 ГЛАВНОЕ ИЗМЕНЕНИЕ ЗДЕСЬ
     def send_notification(self, type_, text, project_override=None):
         if not self.running: return
 
-        # Определяем имя проекта (обычно зашито жестко как "HackQuest" в вызовах старых,
-        # но лучше передавать динамически. Пока оставим HackQuest по умолчанию)
-        proj = project_override if project_override else "HackQuest"
+        proj = project_override if project_override else self.project_name
 
         try:
-            # 1. ПРОВЕРКА НАСТРОЕК (ФИЛЬТР) ПРЯМО НА ИСТОЧНИКЕ
-            # Если глобальный мьют включен - выходим
             if self.writer.get("settings:mute_all") == "1":
                 return
-            # Если проект заглушен - выходим
             if self.writer.get(f"settings:mute:{proj}") == "1":
                 return
 
-            # 2. Формируем пакет
             payload = {
                 "type": type_, "project": proj, "worker": self.worker_name, "text": text
             }
             json_data = json.dumps(payload)
 
-            # 3. ОТПРАВЛЯЕМ В REDIS И СМОТРИМ, КТО УСЛЫШАЛ
             listeners_count = self.writer.publish("telegram_alerts", json_data)
 
-            # 4. ЕСЛИ listeners_count == 0, ЗНАЧИТ БОТ ВЫКЛЮЧЕН
-            # Включаем аварийную прямую отправку
             if listeners_count == 0:
                 self._fallback_send_direct(type_, proj, text)
 
@@ -172,13 +170,11 @@ class BotLink:
             if DEBUG_MODE: print(f"Send error: {e}")
 
     def _fallback_send_direct(self, type_, project, text):
-        """Отправляет сообщение напрямую в Telegram, если bot.py мертв"""
         try:
             token = getattr(config, 'TG_BOT_TOKEN', None)
             uid = getattr(config, 'TG_USER_ID', None)
             if not token or not uid: return
 
-            # Формируем такой же красивый текст, как делал bot.py
             header = f"🤖 <b>{project}</b> | {self.worker_name}"
 
             if type_ == "error":
@@ -197,7 +193,8 @@ class BotLink:
             pass
 
     def _listener_loop(self):
-        channel = f"cmd:HackQuest:{self.worker_name}"
+        # 👇 4. СЛУШАЕМ ТОЛЬКО СВОЙ КАНАЛ (НЕ ХАРДКОД!)
+        channel = f"cmd:{self.project_name}:{self.worker_name}"
         try:
             self.pubsub.subscribe(channel)
         except:
@@ -213,13 +210,17 @@ class BotLink:
                     elif data == "update_status":
                         stats = self._extract_stats()
                         if stats:
-                            self.writer.hset("status:HackQuest", self.worker_name, json.dumps(stats))
+                            self.writer.hset(f"status:{self.project_name}", self.worker_name, json.dumps(stats))
             except:
                 time.sleep(1)
             time.sleep(0.1)
 
     def start_listener(self):
-        t = threading.Thread(target=self._listener_loop, daemon=True)
+        for t in threading.enumerate():
+            if t.name == "BotListener":
+                return
+
+        t = threading.Thread(target=self._listener_loop, daemon=True, name="BotListener")
         t.start()
 
 

@@ -486,14 +486,44 @@ async def data_prune_list_worker(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("data_do_del_"))
 async def data_do_del_worker(callback: CallbackQuery):
-    _, payload = callback.data.split("_", 3)  # data, do, del, proj|name
-    proj, name = payload.split("|")
+    # 👇 ИСПРАВЛЕНИЕ: Используем replace вместо split, чтобы не было ошибки unpacking
+    payload = callback.data.replace("data_do_del_", "")
 
-    r.hdel(f"status:{proj}", name)
-    await callback.answer(f"Воркер {name} удален!", show_alert=True)
-    # Возвращаемся в список
-    callback.data = f"data_prune_list_{proj}"
-    await data_prune_list_worker(callback)
+    if "|" in payload:
+        # split("|", 1) гарантирует, что мы разделим только по первому разделителю
+        # это важно, если вдруг в имени воркера тоже есть символ "|"
+        proj, name = payload.split("|", 1)
+
+        r.hdel(f"status:{proj}", name)
+        await callback.answer(f"Воркер {name} удален!", show_alert=True)
+
+        # Возвращаемся в список
+        # Подменяем data, чтобы функция списка сработала как надо
+        callback = getattr(callback, "message", callback)  # хак для совместимости типов, если нужно
+
+        # Но проще просто вызвать функцию отрисовки заново через изменение data
+        # Однако в aiogram объект callback неизменяем в плане data для роутера,
+        # поэтому мы просто шлем новую клавиатуру вручную или вызываем функцию списка.
+
+        # Самый надежный способ вернуться назад - вызвать функцию списка:
+        # Нам нужно сымитировать вызов data_prune_list_worker с правильным callback.data
+        class FakeCallback:
+            def __init__(self, original, new_data):
+                self.original = original
+                self.data = new_data
+                self.message = original.message
+                self.answer = original.answer
+
+            # Проксируем все остальные атрибуты
+            def __getattr__(self, name):
+                return getattr(self.original, name)
+
+        # Создаем фейковый колбэк с нужной датой для возврата в меню
+        fake_cb = FakeCallback(callback, f"data_prune_list_{proj}")
+        await data_prune_list_worker(fake_cb)
+
+    else:
+        await callback.answer("Ошибка структуры данных", show_alert=True)
 
 
 # === СБРОС ОШИБОК ===
