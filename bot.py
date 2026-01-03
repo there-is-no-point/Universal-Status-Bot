@@ -27,6 +27,15 @@ except Exception as e:
 
 # === 🛡 ЛОГИКА ПРОВЕРКИ УВЕДОМЛЕНИЙ ===
 def is_notification_enabled(project_name: str, msg_type: str) -> bool:
+    # 1. Финальный отчет и логи пропускаем ВСЕГДА (если не выключено глобально mute_all)
+    if msg_type == "worker_finished" or msg_type == "log_delivery":
+        # Проверяем только глобальный мут всего бота
+        if r.get("settings:mute_all") == "1": return False
+        # И мут конкретного проекта (если он полностью замьючен)
+        if r.get(f"settings:mute:{project_name}") == "1": return False
+        return True
+
+    # 2. Определяем тип для проверки настроек
     if "log" in msg_type:
         check_type = "log"
     elif "error" in msg_type:
@@ -36,9 +45,17 @@ def is_notification_enabled(project_name: str, msg_type: str) -> bool:
     else:
         check_type = "info"
 
+    # 3. Настройки Проекта
+    # Если check_type == "success", и значение "0", это значит Summary Mode.
+    # Но фильтрацию сообщений делает monitor.py, а не бот.
+    # Бот здесь просто проверяет явные запреты.
+    # Поэтому, если monitor.py уже решил отправить сообщение (значит режим Detailed), мы его пропускаем.
+
+    # Единственное, что нужно проверить - это явный запрет ошибок или логов
     proj_setting = r.get(f"settings:notify:{project_name}:{check_type}")
     if proj_setting is not None: return proj_setting == "1"
 
+    # 4. Глобальные настройки
     global_setting = r.get(f"settings:notify:GLOBAL:{check_type}")
     if global_setting is not None: return global_setting == "1"
 
@@ -63,12 +80,20 @@ async def alert_listener():
 
                 if is_notification_enabled(project, msg_type):
                     header = f"🤖 <b>{project}</b> | {worker}"
+
                     if msg_type == "error":
                         await bot.send_message(config.TG_USER_ID, f"🔴 <b>ALARM:</b>\n{header}\n\n<pre>{text}</pre>",
                                                parse_mode="HTML")
+
                     elif msg_type == "success":
                         await bot.send_message(config.TG_USER_ID, f"✅ <b>FINISHED:</b>\n{header}\n\n{text}",
                                                parse_mode="HTML")
+
+                    # ✨ НОВЫЙ ТИП: Финальный отчет (Приходит всегда в конце)
+                    elif msg_type == "worker_finished":
+                        await bot.send_message(config.TG_USER_ID, f"🏁 <b>JOB COMPLETED:</b>\n{header}\n\n{text}",
+                                               parse_mode="HTML")
+
                     elif msg_type == "log_delivery":
                         file_obj = io.BytesIO(text.encode('utf-8'))
                         file_obj.name = f"log_{worker}_{datetime.now().strftime('%H-%M')}.txt"
@@ -265,7 +290,9 @@ async def render_settings_root(callback: CallbackQuery):
 @dp.callback_query(F.data == "settings_notify_list")
 async def settings_notify_list(callback: CallbackQuery):
     builder = InlineKeyboardBuilder()
-    builder.row(InlineKeyboardButton(text="🌐 ВСЕ (Глобально)", callback_data="notify_edit_GLOBAL"))
+
+    # --- ИЗМЕНЕНИЕ 1: Глобальные настройки в самом верху ---
+    builder.row(InlineKeyboardButton(text="🌐 Глобальные (шаблон)", callback_data="notify_edit_GLOBAL"))
 
     keys = r.keys("status:*")
     projects = set()
@@ -274,12 +301,11 @@ async def settings_notify_list(callback: CallbackQuery):
         if len(parts) > 1: projects.add(parts[1])
 
     if projects:
-        builder.row(InlineKeyboardButton(text="👇 Настроить отдельно 👇", callback_data="ignore"))
         for proj in sorted(projects):
             builder.row(InlineKeyboardButton(text=f"🔹 {proj}", callback_data=f"notify_edit_{proj}"))
 
     builder.row(InlineKeyboardButton(text="🔙 Назад", callback_data="menu_settings"))
-    text = "🔔 <b>Настройка уведомлений</b>"
+    text = "🔔 <b>Настройка уведомлений</b>\nГлобальный шаблон (сверху) при изменении обновляет настройки всех проектов."
     await safe_edit_text(callback, text, builder.as_markup())
 
 
@@ -299,9 +325,28 @@ async def notify_edit_handler(callback: CallbackQuery, target_override=None):
             return None
         return val == "1"
 
-    types_map = [("success", "✅ Success"), ("error", "❌ Errors"), ("log", "📄 Logs")]
+    # 👇 ЛОГИКА КНОПОК
+    # Success переключает между "Detailed" и "Summary"
 
-    for t_code, t_name in types_map:
+    # 1. SUCCESS / SUMMARY
+    success_state = get_state("success")
+    if success_state is None:
+        # По дефолту Detailed (Success=1)
+        btn_text = "🔗 Success: Detailed"
+        action = "0"  # При нажатии станет Summary
+    elif success_state:
+        # Если 1 -> Detailed
+        btn_text = "✅ Success: Detailed"
+        action = "0"  # Станет Summary
+    else:
+        # Если 0 -> Summary
+        btn_text = "📉 Success: Summary Only"
+        action = "1"  # Станет Detailed
+
+    builder.row(InlineKeyboardButton(text=btn_text, callback_data=f"notify_set_{target}|success|{action}"))
+
+    # 2. ОСТАЛЬНЫЕ (Errors, Logs)
+    for t_code, t_name in [("error", "❌ Errors"), ("log", "📄 Logs")]:
         state = get_state(t_code)
         if state is None:
             status_icon = "🔗"
@@ -320,16 +365,30 @@ async def notify_edit_handler(callback: CallbackQuery, target_override=None):
 
     builder.row(InlineKeyboardButton(text="🔙 К списку", callback_data="settings_notify_list"))
     target_display = "Глобальные настройки" if target == "GLOBAL" else f"Проект: {target}"
-    desc = "🔗 - наследует глобальные\n🔔 - включено\n🔕 - выключено"
+    desc = (
+        "⚙️ <b>Режимы уведомлений:</b>\n\n"
+        "✅ <b>Detailed:</b> Уведомления о каждом аккаунте + Финальный отчет.\n"
+        "📉 <b>Summary Only:</b> Тишина во время работы, только Финальный отчет в конце.\n"
+        "❌ <b>Errors:</b> Приходят мгновенно в любом режиме."
+    )
     await safe_edit_text(callback, f"⚙️ <b>{target_display}</b>\n\n{desc}", builder.as_markup())
 
 
 @dp.callback_query(F.data.startswith("notify_set_"))
 async def notify_set_action(callback: CallbackQuery):
     _, _, payload = callback.data.split("_", 2)
-
     target, t_code, val = payload.split("|")
+
+    # 1. Сохраняем настройку
     r.set(f"settings:notify:{target}:{t_code}", val)
+
+    # --- ИЗМЕНЕНИЕ 2: Синхронизация Глобальных со всеми проектами ---
+    if target == "GLOBAL":
+        keys = r.keys("status:*")
+        projs = set(k.split(":")[1] for k in keys if len(k.split(":")) > 1)
+        for proj in projs:
+            r.set(f"settings:notify:{proj}:{t_code}", val)
+
     await notify_edit_handler(callback, target_override=target)
 
 
@@ -353,8 +412,6 @@ async def settings_sorting_menu(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("sort_menu_"))
 async def render_sort_options(callback: CallbackQuery, target_override=None):
-    # 👇 ИЗМЕНЕНИЕ: Если передали target явно (из сохранения), используем его.
-    # Иначе берем из нажатой кнопки.
     if target_override:
         target = target_override
     else:
@@ -395,7 +452,6 @@ async def render_data_page(callback: CallbackQuery):
     builder = InlineKeyboardBuilder()
 
     builder.row(InlineKeyboardButton(text="💾 Бэкап базы (JSON)", callback_data="data_backup"))
-    # 👇 ИЗМЕНЕНО: Ведет на выбор проекта
     builder.row(InlineKeyboardButton(text="🗑 Удалить воркеров (Вручную)", callback_data="data_prune_select_proj"))
     builder.row(InlineKeyboardButton(text="🧹 Сбросить ошибки", callback_data="data_clear_errors_menu"))
     builder.row(InlineKeyboardButton(text="💣 Полный сброс", callback_data="data_factory_reset_confirm"))
@@ -471,11 +527,9 @@ async def data_prune_list_worker(callback: CallbackQuery):
         except:
             continue
 
-    # Сортируем: сначала те, кто дольше всего молчит
     sorted_workers.sort(key=lambda x: x[1], reverse=True)
 
     for name, hrs in sorted_workers:
-        # ❌ Server-1 (26h)
         ago_text = f"{hrs}ч" if hrs < 240 else ">10д"
         btn_text = f"❌ {name} ({ago_text})"
         builder.row(InlineKeyboardButton(text=btn_text, callback_data=f"data_do_del_{proj}|{name}"))
@@ -486,27 +540,14 @@ async def data_prune_list_worker(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("data_do_del_"))
 async def data_do_del_worker(callback: CallbackQuery):
-    # 👇 ИСПРАВЛЕНИЕ: Используем replace вместо split, чтобы не было ошибки unpacking
     payload = callback.data.replace("data_do_del_", "")
 
     if "|" in payload:
-        # split("|", 1) гарантирует, что мы разделим только по первому разделителю
-        # это важно, если вдруг в имени воркера тоже есть символ "|"
         proj, name = payload.split("|", 1)
-
         r.hdel(f"status:{proj}", name)
+
         await callback.answer(f"Воркер {name} удален!", show_alert=True)
 
-        # Возвращаемся в список
-        # Подменяем data, чтобы функция списка сработала как надо
-        callback = getattr(callback, "message", callback)  # хак для совместимости типов, если нужно
-
-        # Но проще просто вызвать функцию отрисовки заново через изменение data
-        # Однако в aiogram объект callback неизменяем в плане data для роутера,
-        # поэтому мы просто шлем новую клавиатуру вручную или вызываем функцию списка.
-
-        # Самый надежный способ вернуться назад - вызвать функцию списка:
-        # Нам нужно сымитировать вызов data_prune_list_worker с правильным callback.data
         class FakeCallback:
             def __init__(self, original, new_data):
                 self.original = original
@@ -514,11 +555,9 @@ async def data_do_del_worker(callback: CallbackQuery):
                 self.message = original.message
                 self.answer = original.answer
 
-            # Проксируем все остальные атрибуты
             def __getattr__(self, name):
                 return getattr(self.original, name)
 
-        # Создаем фейковый колбэк с нужной датой для возврата в меню
         fake_cb = FakeCallback(callback, f"data_prune_list_{proj}")
         await data_prune_list_worker(fake_cb)
 
@@ -597,7 +636,6 @@ async def show_about(callback: CallbackQuery):
         "Предложения по улучшению присылайте сюда👇\n"
     )
     builder = InlineKeyboardBuilder()
-    #  ССЫЛКА НА GITHUB
     builder.row(InlineKeyboardButton(text="🐙 GitHub Repository",
                                      url="https://github.com/there-is-no-point/Universal-Status-Bot"))
     builder.row(InlineKeyboardButton(text="🔙 Назад", callback_data="menu_start"))
