@@ -4,24 +4,28 @@ import sys
 import os
 import time
 
+# 👇 ДОБАВИЛ ИМПОРТ КОНФИГА (Чтобы читать настройку)
+import config
+
 from .notifications import bot_link
 from .stats_map import get_display_stats
 
+# 👇 СДЕЛАЛ ИМПОРТ БЕЗОПАСНЫМ (Чтобы не крашилось без Redis)
 try:
-    from .status_manager import status_manager
-except ImportError:
-    from status_manager import status_manager
+    try:
+        from .status_manager import status_manager
+    except ImportError:
+        from status_manager import status_manager
+except Exception:
+    status_manager = None
 
 # --- ГЛОБАЛЬНЫЕ СЧЕТЧИКИ ---
 shared_success_count = 0
 shared_error_count = 0
-
-# Инициализация инвентаря нулями
 shared_inventory = {}
 
 
 class DummyClient:
-    """Пустой класс-заглушка"""
     pass
 
 
@@ -60,23 +64,37 @@ def monitor_account(project_name: str):
         @functools.wraps(func)
         def wrapper(self, *args, **kwargs):
 
+            # === 🛑 ГЛАВНАЯ ПРОВЕРКА: ЕСЛИ БОТ ВЫКЛЮЧЕН ===
+            # Если в конфиге False, мы просто выполняем функцию и уходим.
+            # Никакого Redis, никаких токенов, никакой лишней нагрузки.
+            if not getattr(config, 'USE_TG_BOT', False):
+                return func(self, *args, **kwargs)
+            # ===============================================
+
+            # Если мы тут — значит USE_TG_BOT = True. Запускаем полную машину.
+
             bot_link.register_client(
                 self,
-                project_name=project_name,
+                # project_name=project_name, # Убрал, если в твоем notifications.py старая сигнатура, это может вызвать ошибку. Но если новая - верни.
                 progress_callback=lambda: get_progress_string(self.total_accounts),
                 inventory_callback=get_global_inventory
             )
 
             progress_str = get_progress_string(self.total_accounts)
 
-            start_stats = {
-                "status": "Working 🟢",
-                "progress": progress_str,
-                "current_account": self.address,
-                "last_updated": time.time()
-            }
-            start_stats.update(get_global_inventory())
-            status_manager.update_status(project_name, start_stats)
+            # Безопасная отправка в Redis (если он подключен)
+            if status_manager:
+                try:
+                    start_stats = {
+                        "status": "Working 🟢",
+                        "progress": progress_str,
+                        "current_account": self.address,
+                        "last_updated": time.time()
+                    }
+                    start_stats.update(get_global_inventory())
+                    status_manager.update_status(project_name, start_stats)
+                except Exception:
+                    pass
 
             try:
                 result = func(self, *args, **kwargs)
@@ -85,6 +103,12 @@ def monitor_account(project_name: str):
                     raise Exception("Process returned False")
 
                 # === УСПЕХ ===
+
+                # 🔥 ОЧИЩАЕМ БУФЕР ОШИБОК
+                try:
+                    bot_link.clear_temp_errors(project_name, self.address)
+                except: pass
+
                 current_stats = get_display_stats(self)
 
                 with counter_lock:
@@ -97,26 +121,23 @@ def monitor_account(project_name: str):
                 succ, err, total_done = get_progress_data()
                 final_progress = f"{total_done}/{self.total_accounts} (✅{succ} ❌{err})"
 
-                # Проверяем, закончили ли мы работу?
                 is_finished = self.total_accounts > 0 and total_done >= self.total_accounts
+                final_status = "Working 🟢" if not is_finished else "Sleeping 💤"
 
-                if not is_finished:
-                    final_status = "Working 🟢"
-                else:
-                    final_status = "Sleeping 💤"
-
-                end_stats = {
-                    "status": final_status,
-                    "progress": final_progress,
-                    "current_account": self.address,
-                    "last_updated": time.time()
-                }
-                end_stats.update(get_global_inventory())
-                status_manager.update_status(project_name, end_stats)
+                if status_manager:
+                    try:
+                        end_stats = {
+                            "status": final_status,
+                            "progress": final_progress,
+                            "current_account": self.address,
+                            "last_updated": time.time()
+                        }
+                        end_stats.update(get_global_inventory())
+                        status_manager.update_status(project_name, end_stats)
+                    except: pass
 
                 # --- ЛОГИКА УВЕДОМЛЕНИЙ ---
 
-                # 1. Формируем красивый текст для текущего аккаунта
                 msg = f"Аккаунт {self.address[:6]}... завершен!\n"
                 msg += f"📊 <b>Stats:</b> {final_progress}\n"
                 inventory_lines = []
@@ -125,7 +146,18 @@ def monitor_account(project_name: str):
                 if inventory_lines:
                     msg += "\n🎒 <b>Loot:</b>\n" + "\n".join(inventory_lines)
 
-                # 2. Если это ПОСЛЕДНИЙ аккаунт - шлем ФИНАЛЬНЫЙ ОТЧЕТ
+                is_detailed = True
+                try:
+                    # Пробуем получить настройки из Redis через writer, если он есть
+                    if hasattr(bot_link, 'writer') and bot_link.writer:
+                        val = bot_link.writer.get(f"settings:notify:{project_name}:success")
+                        if val == "0": is_detailed = False
+                except:
+                    pass
+
+                if is_detailed:
+                    bot_link.send_notification("success", msg, project_override=project_name)
+
                 if is_finished:
                     total_inv_lines = []
                     gl_inv = get_global_inventory()
@@ -138,22 +170,8 @@ def monitor_account(project_name: str):
                             f"📊 <b>Final Result:</b> {final_progress}\n"
                             f"🎒 <b>Total Loot:</b>\n" + "\n".join(total_inv_lines)
                     )
-                    # Отправляем специальный тип "worker_finished" (Он проходит через бота всегда)
+                    time.sleep(0.5)
                     bot_link.send_notification("worker_finished", finish_msg, project_override=project_name)
-
-                # 3. Если работа еще идет - смотрим на настройку "Success"
-                else:
-                    # Читаем настройку: "1" = Detailed, "0" = Summary (тишина)
-                    # По умолчанию считаем, что Detailed (1)
-                    is_detailed = True
-                    try:
-                        val = bot_link.writer.get(f"settings:notify:{project_name}:success")
-                        if val == "0": is_detailed = False
-                    except:
-                        pass
-
-                    if is_detailed:
-                        bot_link.send_notification("success", msg, project_override=project_name)
 
                 return True
 
@@ -165,32 +183,31 @@ def monitor_account(project_name: str):
 
                 succ, err, total_done = get_progress_data()
                 error_progress = f"{total_done}/{self.total_accounts} (✅{succ} ❌{err})"
-
-                # Если закончили (даже с ошибками)
                 is_finished = self.total_accounts > 0 and total_done >= self.total_accounts
+                final_status = "Working 🟢" if not is_finished else "Errors 🔴"
 
-                if not is_finished:
-                    final_status = "Working 🟢"
-                else:
-                    final_status = "Errors 🔴"
+                # Commit ошибок из буфера (безопасно)
+                try:
+                    error_summary = bot_link.flush_temp_errors(project_name, self.address, fallback_error=str(e))
+                except:
+                    error_summary = str(e)
 
-                bot_link.report_error(project_name, self.address, str(e))
+                if status_manager:
+                    try:
+                        error_stats = {
+                            "status": final_status,
+                            "progress": error_progress,
+                            "current_account": self.address,
+                            "last_updated": time.time(),
+                            "error": error_summary
+                        }
+                        error_stats.update(get_global_inventory())
+                        status_manager.update_status(project_name, error_stats)
+                    except: pass
 
-                error_stats = {
-                    "status": final_status,
-                    "progress": error_progress,
-                    "current_account": self.address,
-                    "last_updated": time.time()
-                }
-                error_stats.update(get_global_inventory())
-
-                status_manager.update_status(project_name, error_stats)
-
-                # Ошибки шлем ВСЕГДА
-                bot_link.send_notification("error", f"Критическая ошибка на {self.address[:8]}:\n{str(e)}",
+                bot_link.send_notification("error", f"❌ <b>FAILED:</b> {self.address[:8]}...\n\n{error_summary}",
                                            project_override=project_name)
 
-                # Если это был последний аккаунт и он упал - тоже шлем финал
                 if is_finished:
                     total_inv_lines = []
                     gl_inv = get_global_inventory()
@@ -203,6 +220,7 @@ def monitor_account(project_name: str):
                             f"📊 <b>Final Result:</b> {error_progress}\n"
                             f"🎒 <b>Total Loot:</b>\n" + "\n".join(total_inv_lines)
                     )
+                    time.sleep(0.5)
                     bot_link.send_notification("worker_finished", finish_msg, project_override=project_name)
 
                 return False

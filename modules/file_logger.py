@@ -1,38 +1,29 @@
 import logging
 from logging.handlers import RotatingFileHandler
 import os
+# Импортируем bot_link, чтобы отправлять в Redis
+from .notifications import bot_link
 
 
 class SmartFormatter(logging.Formatter):
     """
-    Умный форматировщик:
-    1. Проверяет, есть ли в логе переменная 'address', 'wallet' или 'account'.
-    2. Если есть — добавляет её отдельным столбцом.
-    3. Если нет — пишет лог в стандартном формате.
+    Умный форматировщик
     """
 
     def format(self, record):
-        # 1. Форматируем само сообщение
         record.message = record.getMessage()
-
-        # 2. ГАРАНТИРОВАННО создаем время (asctime), даже если Python думает, что оно не нужно
         if not hasattr(record, 'asctime'):
             record.asctime = self.formatTime(record, self.datefmt)
 
-        # 3. Ищем адрес кошелька в переменных
         wallet = getattr(record, 'address', None) or \
                  getattr(record, 'wallet', None) or \
                  getattr(record, 'account', None)
 
-        # 4. Собираем итоговую строку
         if wallet:
-            # ✅ Формат с кошельком (4-й столбец)
             s = f"{record.asctime} | {record.levelname} | {record.name} | {wallet} | {record.message}"
         else:
-            # ❌ Обычный формат
             s = f"{record.asctime} | {record.levelname} | {record.name} | {record.message}"
 
-        # 5. Обработка ошибок (Traceback), если они есть
         if record.exc_info:
             if not record.exc_text:
                 record.exc_text = self.formatException(record.exc_info)
@@ -43,36 +34,65 @@ class SmartFormatter(logging.Formatter):
         return s
 
 
+# === НОВЫЙ КЛАСС: Redis Spy ===
+class RedisErrorHandler(logging.Handler):
+    """
+    Перехватывает ошибки и отправляет их в буфер Redis через bot_link
+    """
+
+    def emit(self, record):
+        # Реагируем только на ERROR и CRITICAL
+        if record.levelno >= logging.ERROR:
+            try:
+                # Пытаемся найти адрес кошелька
+                wallet = getattr(record, 'address', None) or \
+                         getattr(record, 'wallet', None) or \
+                         getattr(record, 'account', None)
+
+                # Если кошелька нет, мы не знаем куда писать ошибку (пропускаем или пишем в Global)
+                if not wallet:
+                    return
+
+                    # Формируем строку как в логе
+                if not hasattr(record, 'asctime'):
+                    record.asctime = self.formatTime(record, "%H:%M:%S")  # Короткое время
+
+                # Формат: TIME | LEVEL | MODULE | MESSAGE
+                log_entry = f"{record.asctime} | {record.levelname} | {record.name} | {record.getMessage()}"
+
+                # Отправляем в буфер
+                # (Проект мы берем из bot_link, так как logger не знает о проекте)
+                bot_link.add_temp_error(bot_link.project_name, wallet, log_entry)
+
+            except Exception:
+                self.handleError(record)
+
+
 def install_file_logger():
-    # 1. Получаем корневой логгер
     root_logger = logging.getLogger()
 
-    # 2. Проверяем, не подключен ли уже файл
+    # Проверка чтобы не дублировать
     for handler in root_logger.handlers:
         if isinstance(handler, RotatingFileHandler) and "app.log" in handler.baseFilename:
             return
 
-    # 3. Настраиваем файл
+    # 1. Файловый логгер (как было)
     log_file = "app.log"
     file_handler = RotatingFileHandler(
-        log_file,
-        maxBytes=5 * 1024 * 1024,
-        backupCount=1,
-        encoding="utf-8"
+        log_file, maxBytes=5 * 1024 * 1024, backupCount=1, encoding="utf-8"
     )
 
-    # 4. ПОДКЛЮЧАЕМ НАШ УМНЫЙ ФОРМАТИРОВЩИК
-    # Передаем и fmt, и datefmt, чтобы всё работало корректно
     formatter = SmartFormatter(
         fmt="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
         datefmt="%H:%M:%S"
     )
-
     file_handler.setFormatter(formatter)
-
-    # 5. Цепляем к системе
     root_logger.addHandler(file_handler)
 
+    # 2. 🔥 ПОДКЛЮЧАЕМ НАШ ШПИОН (Redis Handler)
+    redis_handler = RedisErrorHandler()
+    # Ему не нужен форматтер, он сам форматирует внутри emit
+    root_logger.addHandler(redis_handler)
 
-# Запускаем установку сразу при импорте
+
 install_file_logger()
