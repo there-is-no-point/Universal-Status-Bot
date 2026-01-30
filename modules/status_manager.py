@@ -2,41 +2,33 @@ import json
 import threading
 import requests
 import redis
-import time  # 👈 Добавлен импорт времени
+import time
 from datetime import datetime
 import sys
 import os
 
 # --- НАСТРОЙКИ ОТЛАДКИ ---
-# Поставь True, если бот не запускается или не видит конфиг
 DEBUG_MODE = False
 # -------------------------
 
-# 1. Windows Fix: Принудительно добавляем корень проекта в пути
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 if DEBUG_MODE:
     print("\n" + "=" * 30)
     print("📊 [DEBUG] STATUS MANAGER STARTUP")
-    print(f"📂 Module path: {os.path.dirname(os.path.abspath(__file__))}")
 
 try:
     import config
-
-    if DEBUG_MODE:
-        print(f"✅ Config imported: {config}")
-        print(f"🔎 DEVICE_NAME: {getattr(config, 'DEVICE_NAME', '❌ MISSING')}")
-        print(f"🔎 REDIS_URL: {'✅ FOUND' if getattr(config, 'REDIS_URL', None) else '❌ MISSING'}")
 except ImportError as e:
     print(f"❌ [StatusManager] CRITICAL: Config import failed! {e}")
     config = None
-except Exception as e:
-    print(f"❌ [StatusManager] CRITICAL: Unexpected config error: {e}")
-    config = None
 
-if DEBUG_MODE:
-    print("=" * 30 + "\n")
-
+# 🔥 ВАЖНО: Импортируем bot_link, чтобы узнавать динамическое имя (--worker)
+# Используем try-except, чтобы избежать циклических импортов, если они возникнут
+try:
+    from .notifications import bot_link
+except ImportError:
+    bot_link = None
 
 class StatusManager:
     _instance = None
@@ -51,13 +43,11 @@ class StatusManager:
     def _init_redis(self):
         try:
             if hasattr(config, 'REDIS_URL') and config.REDIS_URL:
-                # ssl_cert_reqs=None решает проблему SSL на Windows
                 self._redis = redis.Redis.from_url(
                     config.REDIS_URL,
                     decode_responses=True,
                     ssl_cert_reqs=None
                 )
-                # Быстрая проверка соединения
                 self._redis.ping()
                 if DEBUG_MODE:
                     print(f"✅ [StatusManager] Redis Connected!")
@@ -71,20 +61,27 @@ class StatusManager:
     def update_status(self, project_name: str, data: dict):
         """
         Отправляет статус в Redis.
+        Имя воркера берется динамически, если задан аргумент --worker.
         """
         if not self._redis: return
 
         try:
-            # Если имя не задано, используем Unknown
-            device_name = getattr(config, 'DEVICE_NAME', 'Unknown_Device')
+            # 👇 ЛОГИКА ОПРЕДЕЛЕНИЯ ИМЕНИ
+            # 1. Сначала пробуем узнать имя у bot_link (оно там правильное, с учетом флагов запуска)
+            if bot_link and hasattr(bot_link, 'worker_name'):
+                device_name = bot_link.worker_name
+            else:
+                # 2. Если не вышло - берем стандартное из конфига
+                device_name = getattr(config, 'DEVICE_NAME', getattr(config, 'WORKER_NAME', 'Unknown_Device'))
 
-            # 👇 ГЛАВНОЕ ИЗМЕНЕНИЕ: Отправляем Unix Timestamp (число)
+            # Добавляем время последнего обновления
             data["last_updated"] = time.time()
 
             data_str = json.dumps(data, ensure_ascii=False)
 
+            # Пишем в Redis под правильным (динамическим) именем
             self._redis.hset(f"status:{project_name}", device_name, data_str)
-            self._redis.expire(f"status:{project_name}", 86400)  # TTL 24h
+            self._redis.expire(f"status:{project_name}", 86400)
 
             if DEBUG_MODE:
                 print(f"📤 [DEBUG] Status sent for {device_name}")
@@ -94,12 +91,14 @@ class StatusManager:
                 print(f"❌ [StatusManager] Redis Write Error: {e}")
 
     def send_alert(self, text: str, status: str = "Info"):
-        """
-        Отправляет критические уведомления в TG (если включено).
-        """
         if not getattr(config, 'USE_TG_BOT', False): return
 
-        device = getattr(config, 'DEVICE_NAME', 'Unknown')
+        # Тут тоже пытаемся взять правильное имя для заголовка
+        if bot_link and hasattr(bot_link, 'worker_name'):
+            device = bot_link.worker_name
+        else:
+            device = getattr(config, 'DEVICE_NAME', 'Unknown')
+
         emoji = "✅" if status == "Success" else "❌" if status == "Error" else "⚠️"
         msg = f"{emoji} <b>{status}</b> [{device}]\n\n{text}"
 

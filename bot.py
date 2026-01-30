@@ -16,13 +16,8 @@ import config
 bot = Bot(token=config.TG_BOT_TOKEN)
 dp = Dispatcher()
 
-# ⏱ ДЕФОЛТНЫЙ ЛИМИТ ТИШИНЫ (Если воркер не прислал свой)
-# Используется как запасной вариант для старых версий софта
+# ⏱ ДЕФОЛТНЫЙ ЛИМИТ ТИШИНЫ
 DEFAULT_OFFLINE_TIMEOUT = 900  # 15 минут
-
-# 🛡 БУФЕР БЕЗОПАСНОСТИ (в секундах)
-# Добавляем это время к таймеру воркера, чтобы избежать ложных срабатываний
-# из-за задержек сети или рассинхрона.
 SAFETY_BUFFER = 300  # 5 минут
 
 try:
@@ -162,6 +157,28 @@ async def safe_edit_text(callback: CallbackQuery, text: str, reply_markup=None):
         await callback.answer()
 
 
+# === ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ ДЛЯ АНАЛИЗА ВОРКЕРА ===
+def analyze_worker_status(stats: dict, now: float):
+    """Возвращает статус, эмодзи и флаги ошибки/активности"""
+    st = str(stats.get("status", "Unknown")).lower()
+    ts = float(stats.get("last_updated", 0))
+
+    w_heartbeat = int(stats.get("heartbeat_threshold", DEFAULT_OFFLINE_TIMEOUT))
+    dynamic_limit = w_heartbeat + SAFETY_BUFFER
+
+    time_diff = now - ts
+    is_working_state = "working" in st or "active" in st
+
+    if is_working_state and time_diff > dynamic_limit:
+        return "offline 🔇", "🔴", True, False  # is_error, is_active
+
+    is_error = "error" in st or "fail" in st
+    is_active = is_working_state
+    emoji = get_status_emoji(st)
+
+    return st, emoji, is_error, is_active
+
+
 # ==========================================
 # 👇 ГЛАВНОЕ МЕНЮ
 # ==========================================
@@ -224,27 +241,17 @@ async def show_projects_menu(callback: CallbackQuery):
             workers_data = r.hgetall(key)
             for _, w_json in workers_data.items():
                 w_stats = json.loads(w_json)
-                st = str(w_stats.get("status", "")).lower()
                 ts = float(w_stats.get("last_updated", 0))
                 if ts > max_ts: max_ts = ts
-
-                # Читаем настройку тайм-аута от самого воркера
-                w_heartbeat = int(w_stats.get("heartbeat_threshold", DEFAULT_OFFLINE_TIMEOUT))
-                # Рассчитываем динамический лимит: Время воркера + Буфер 5 мин
-                dynamic_limit = w_heartbeat + SAFETY_BUFFER
 
                 acc_count = int(w_stats.get("pos_total", 0))
                 total_scale_accs += acc_count
 
-                # 🔥 ПРОВЕРКА НА ОФФЛАЙН (ДИНАМИЧЕСКАЯ)
-                is_working_state = "working" in st or "active" in st
-                time_diff = now - ts
+                st, _, is_err, is_act = analyze_worker_status(w_stats, now)
 
-                if is_working_state and time_diff > dynamic_limit:
+                if is_err:
                     errors += 1
-                elif "error" in st or "fail" in st:
-                    errors += 1
-                elif is_working_state:
+                elif is_act:
                     active += 1
                 else:
                     sleep += 1
@@ -280,64 +287,101 @@ async def show_projects_menu(callback: CallbackQuery):
 
 
 # ==========================================
-# 👇 СПИСОК ВОРКЕРОВ
+# 👇 МЕНЮ ВОРКЕРОВ (С ДЕТАЛЬНОЙ ГРУППИРОВКОЙ)
 # ==========================================
 @dp.callback_query(F.data.startswith("proj_"))
 async def show_devices(callback: CallbackQuery):
     project_name = callback.data.split("_")[1]
     devices_data = r.hgetall(f"status:{project_name}")
     builder = InlineKeyboardBuilder()
-
-    dev_list = []
     now = time.time()
 
-    if devices_data:
-        for dev_name, json_str in devices_data.items():
-            try:
-                stats = json.loads(json_str)
-                st = str(stats.get("status", "Unknown")).lower()
-                ts = float(stats.get("last_updated", 0))
+    if not devices_data:
+        await safe_edit_text(callback, f"📂 <b>{project_name}</b>\nСписок пуст.", builder.as_markup())
+        return
 
-                # Читаем настройку тайм-аута от воркера
-                w_heartbeat = int(stats.get("heartbeat_threshold", DEFAULT_OFFLINE_TIMEOUT))
-                dynamic_limit = w_heartbeat + SAFETY_BUFFER
+    # 1. Сначала собираем все данные
+    all_workers = []
+    for dev_name, json_str in devices_data.items():
+        try:
+            stats = json.loads(json_str)
+            st, emoji, is_err, is_act = analyze_worker_status(stats, now)
+            all_workers.append({
+                "name": dev_name, "raw_stats": stats,
+                "st": st, "emoji": emoji, "is_err": is_err, "is_act": is_act
+            })
+        except:
+            continue
 
-                time_diff = now - ts
-                is_working_state = "working" in st or "active" in st
+    # 2. Группируем воркеров
+    groups = {}
 
-                # 🔥 Логика Offline
-                if is_working_state and time_diff > dynamic_limit:
-                    st = "offline 🔇"
-                    emoji = "🔴"
-                    is_active = False
-                    is_error = True
-                else:
-                    is_active = is_working_state
-                    is_error = "error" in st or "fail" in st
-                    emoji = get_status_emoji(st)
+    # Сортируем по имени
+    all_workers.sort(key=lambda x: x["name"])
 
-                dev_list.append({
-                    "name": dev_name, "emoji": emoji, "status_raw": st,
-                    "ts": ts, "is_error": is_error, "is_active": is_active
-                })
-            except:
-                continue
+    for w in all_workers:
+        # Пытаемся найти родителя (всё что до последнего подчеркивания)
+        parts = w["name"].split("_")
+        if len(parts) == 1:
+            base_name = w["name"]
+        else:
+            base_name = "_".join(parts[:-1])
 
-    sort_mode = r.get("settings:sort_dev") or "priority"
-    if sort_mode == "priority":
-        dev_list.sort(key=lambda x: (x["is_error"], x["is_active"], x["name"]), reverse=True)
-    elif sort_mode == "latest":
-        dev_list.sort(key=lambda x: x["ts"], reverse=True)
-    else:
-        dev_list.sort(key=lambda x: x["name"])
+        if base_name not in groups:
+            groups[base_name] = []
+        groups[base_name].append(w)
 
-    for item in dev_list:
-        btn_txt = f"{item['emoji']} {item['name']} | {item['status_raw'].title()}"
-        builder.row(InlineKeyboardButton(text=btn_txt, callback_data=f"dev_{project_name}|{item['name']}"))
+    final_list = []
 
-    active = sum(1 for x in dev_list if x['is_active'])
-    errors = sum(1 for x in dev_list if x['is_error'])
-    sleep = len(dev_list) - active - errors
+    for base, members in groups.items():
+        # Если в группе только 1 элемент, показываем как есть (без папки)
+        # Исключение: если имя элемента отличается от базы (редкий случай), лучше всё равно показать.
+        # Но для красоты: Single показываем как Single.
+        if len(members) == 1:
+            final_list.append({"type": "single", "data": members[0]})
+        else:
+            # Считаем статистику внутри группы
+            g_active = sum(1 for m in members if m['is_act'])
+            g_errors = sum(1 for m in members if m['is_err'])
+            g_total = len(members)
+            g_sleep = g_total - g_active - g_errors
+
+            final_list.append({
+                "type": "group",
+                "name": base,
+                "stats": (g_active, g_sleep, g_errors),  # Сохраняем цифры
+                "members": members
+            })
+
+    # Сортировка: Сначала папки, потом одиночные (или наоборот, как удобнее)
+    # Сейчас сортируем просто по алфавиту имен
+    final_list.sort(key=lambda x: x["name"] if x["type"] == "group" else x["data"]["name"])
+
+    # 3. Рендерим кнопки
+    for item in final_list:
+        if item["type"] == "single":
+            w = item["data"]
+            btn_txt = f"{w['emoji']} {w['name']} | {w['st'].title()}"
+            builder.row(InlineKeyboardButton(text=btn_txt, callback_data=f"dev_{project_name}|{w['name']}"))
+        else:
+            # 🔥 ПАПКА С ДЕТАЛЬНОЙ СТАТИСТИКОЙ
+            base = item["name"]
+            act, slp, err = item["stats"]
+
+            # Формируем красивую строку: 📂 Name | 🟢1 💤2 🔴0
+            stats_str = f"🟢{act} 💤{slp}"
+            if err > 0:
+                stats_str += f" 🔴{err}"  # Красный показываем только если есть ошибки, или всегда (по желанию)
+            else:
+                stats_str += f" 🔴0"
+
+            btn_txt = f"📂 {base} | {stats_str}"
+            builder.row(InlineKeyboardButton(text=btn_txt, callback_data=f"group_{project_name}|{base}"))
+
+    # Статистика проекта (общая)
+    active = sum(1 for w in all_workers if w['is_act'])
+    errors = sum(1 for w in all_workers if w['is_err'])
+    sleep = len(all_workers) - active - errors
 
     text = f"📂 <b>Project: {project_name}</b>\n🟢 Active: {active} | 💤 Sleep: {sleep} | 🔴 Problems: {errors}"
     builder.row(InlineKeyboardButton(text="🔙 Назад", callback_data="menu_projects"))
@@ -345,7 +389,62 @@ async def show_devices(callback: CallbackQuery):
 
 
 # ==========================================
-# 👇 ДЕТАЛЬНАЯ СТРАНИЦА
+# 👇 ПРОСМОТР ГРУППЫ (НОВОЕ МЕНЮ)
+# ==========================================
+@dp.callback_query(F.data.startswith("group_"))
+async def open_device_group(callback: CallbackQuery):
+    _, payload = callback.data.split("_", 1)
+    project_name, base_name = payload.split("|")
+
+    devices_data = r.hgetall(f"status:{project_name}")
+    builder = InlineKeyboardBuilder()
+    now = time.time()
+
+    # Собираем всех, кто относится к этой группе
+    members = []
+    for dev_name, json_str in devices_data.items():
+        # Проверка: начинается ли имя с base_name + "_" ИЛИ равно base_name
+        is_child = dev_name.startswith(f"{base_name}_")
+        is_self = dev_name == base_name
+
+        if is_child or is_self:
+            try:
+                stats = json.loads(json_str)
+                st, emoji, is_err, is_act = analyze_worker_status(stats, now)
+                members.append({
+                    "name": dev_name, "st": st, "emoji": emoji,
+                    "is_err": is_err, "is_act": is_act
+                })
+            except:
+                continue
+
+    # Сортируем: Сначала "Главный" (совпадает с базой), потом остальные по алфавиту
+    members.sort(key=lambda x: (x["name"] != base_name, x["name"]))
+
+    for w in members:
+        # Для дочерних элементов можно убрать префикс для красоты, но лучше оставить полные имена для ясности
+        # Или показывать только суффикс? "Daily", "Test".
+        # Давайте показывать полное имя, но выделим жирным суффикс? Нет, в кнопках нельзя форматировать.
+
+        # Если это сам родитель - пометим его
+        display_name = w["name"]
+        if display_name == base_name:
+            display_name = f"🔹 {display_name} (Main)"
+        else:
+            # Server_Daily -> 🔸 Daily
+            suffix = display_name.replace(f"{base_name}_", "")
+            display_name = f"🔸 {suffix}"
+
+        btn_txt = f"{w['emoji']} {display_name} | {w['st'].title()}"
+        builder.row(InlineKeyboardButton(text=btn_txt, callback_data=f"dev_{project_name}|{w['name']}"))
+
+    text = f"📂 <b>Group: {base_name}</b>\nСписок процессов:"
+    builder.row(InlineKeyboardButton(text="🔙 Назад", callback_data=f"proj_{project_name}"))
+    await safe_edit_text(callback, text, builder.as_markup())
+
+
+# ==========================================
+# 👇 ДЕТАЛЬНАЯ СТРАНИЦА (СУЩЕСТВУЮЩАЯ)
 # ==========================================
 @dp.callback_query(F.data.startswith("dev_"))
 async def show_stats_handler(callback: CallbackQuery):
@@ -358,6 +457,28 @@ async def render_device_page(callback: CallbackQuery, project_name: str, device_
     json_str = r.hget(f"status:{project_name}", device_name)
     builder = InlineKeyboardBuilder()
 
+    # В кнопке Назад теперь надо понять, куда возвращаться: в проект или в группу?
+    # Проверяем, есть ли у этого воркера "семья".
+    # Для простоты всегда возвращаем в список проекта, или можно сделать умный Back.
+    # Сделаем возврат в группу, если он часть группы?
+    # Сложно определить контекст без лишних запросов. Вернем в ПРОЕКТ (как было),
+    # или сделаем хитро: проверим имя.
+
+    # Логика определения родителя
+    parts = device_name.split("_")
+    if len(parts) > 1:
+        base_name = "_".join(parts[:-1])
+        # Проверяем, есть ли другие с таким префиксом. Если да - кнопка "Назад в группу"
+        # Это дорогой запрос. Проще вернуть просто "Назад" (в список воркеров).
+        back_callback = f"proj_{project_name}"
+        # НО! Пользователь просил иерархию.
+        # Если мы зашли из группы, лучше вернуться в группу.
+        # Давайте попробуем вернуть в группу, если имя содержит подчеркивание.
+        # (Это эвристика, но удобная).
+        # А если это Main (Server), но у него есть дети?
+        # Ладно, пусть кнопка ведет в корень проекта, это надежнее.
+        pass
+
     builder.row(
         InlineKeyboardButton(text="📥 Get Log", callback_data=f"cmd_log_{project_name}|{device_name}"),
         InlineKeyboardButton(text="🔄 Обновить", callback_data=f"force_update_{project_name}|{device_name}")
@@ -365,7 +486,7 @@ async def render_device_page(callback: CallbackQuery, project_name: str, device_
     fail_count = r.scard(f"failures:{project_name}:{device_name}")
     btn_text = f"📄 Failed Wallets ({fail_count})" if fail_count > 0 else "📄 Failed Wallets"
     builder.row(InlineKeyboardButton(text=btn_text, callback_data=f"fails_{project_name}|{device_name}"))
-    builder.row(InlineKeyboardButton(text="🔙 Назад", callback_data=f"proj_{project_name}"))
+    builder.row(InlineKeyboardButton(text="🔙 К списку", callback_data=f"proj_{project_name}"))
 
     if not json_str:
         await safe_edit_text(callback, "❌ Данные потеряны", reply_markup=builder.as_markup())

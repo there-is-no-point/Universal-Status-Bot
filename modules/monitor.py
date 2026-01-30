@@ -4,13 +4,13 @@ import sys
 import os
 import time
 
-# 👇 ДОБАВИЛ ИМПОРТ КОНФИГА (Чтобы читать настройку)
+# 👇 ДОБАВИЛ ИМПОРТ КОНФИГА
 import config
 
 from .notifications import bot_link
 from .stats_map import get_display_stats
 
-# 👇 СДЕЛАЛ ИМПОРТ БЕЗОПАСНЫМ (Чтобы не крашилось без Redis)
+# 👇 БЕЗОПАСНЫЙ ИМПОРТ STATUS_MANAGER
 try:
     try:
         from .status_manager import status_manager
@@ -41,6 +41,29 @@ except Exception:
 counter_lock = threading.Lock()
 
 
+# === 🔥 НОВАЯ ФУНКЦИЯ: СБРОС СТАТИСТИКИ ===
+def reset_global_stats():
+    """Сбрасывает все счетчики в ноль (для нового цикла/дня)"""
+    with counter_lock:
+        global shared_success_count, shared_error_count, shared_inventory
+        shared_success_count = 0
+        shared_error_count = 0
+
+        # Сбрасываем инвентарь
+        try:
+            _dummy = DummyClient()
+            _initial = get_display_stats(_dummy)
+            shared_inventory = {}
+            for k, v in _initial.items():
+                if isinstance(v, (int, float)):
+                    shared_inventory[k] = 0
+        except:
+            shared_inventory = {}
+
+
+# ==========================================
+
+
 def get_progress_data():
     with counter_lock:
         succ = shared_success_count
@@ -65,24 +88,37 @@ def monitor_account(project_name: str):
         def wrapper(self, *args, **kwargs):
 
             # === 🛑 ГЛАВНАЯ ПРОВЕРКА: ЕСЛИ БОТ ВЫКЛЮЧЕН ===
-            # Если в конфиге False, мы просто выполняем функцию и уходим.
-            # Никакого Redis, никаких токенов, никакой лишней нагрузки.
             if not getattr(config, 'USE_TG_BOT', False):
                 return func(self, *args, **kwargs)
             # ===============================================
 
-            # Если мы тут — значит USE_TG_BOT = True. Запускаем полную машину.
+            # === 🔥 ЛОГИКА АВТО-СБРОСА (SELF-CLEANING) ===
+            # Определяем, нужно ли сбросить статистику перед стартом
+            current_pos = getattr(self, 'position', 0)
+            _, _, current_total_done = get_progress_data()
+
+            # 1. Если это ПЕРВЫЙ аккаунт в списке -> Значит новый запуск/день
+            is_start_of_cycle = (current_pos == 1)
+
+            # 2. Если мы сделали >= 100% и продолжаем -> Значит новый круг
+            is_overflow = (self.total_accounts > 0 and current_total_done >= self.total_accounts)
+
+            if is_start_of_cycle or is_overflow:
+                # Сбрасываем только если есть старые данные
+                if current_total_done > 0:
+                    reset_global_stats()
+            # ===============================================
 
             bot_link.register_client(
                 self,
-                # project_name=project_name, # Убрал, если в твоем notifications.py старая сигнатура, это может вызвать ошибку. Но если новая - верни.
+                project_name=project_name,  # 🔥 Раскомментировал! Это нужно для работы Heartbeat
                 progress_callback=lambda: get_progress_string(self.total_accounts),
                 inventory_callback=get_global_inventory
             )
 
             progress_str = get_progress_string(self.total_accounts)
 
-            # Безопасная отправка в Redis (если он подключен)
+            # Безопасная отправка в Redis
             if status_manager:
                 try:
                     start_stats = {
@@ -104,10 +140,10 @@ def monitor_account(project_name: str):
 
                 # === УСПЕХ ===
 
-                # 🔥 ОЧИЩАЕМ БУФЕР ОШИБОК
                 try:
                     bot_link.clear_temp_errors(project_name, self.address)
-                except: pass
+                except:
+                    pass
 
                 current_stats = get_display_stats(self)
 
@@ -134,7 +170,8 @@ def monitor_account(project_name: str):
                         }
                         end_stats.update(get_global_inventory())
                         status_manager.update_status(project_name, end_stats)
-                    except: pass
+                    except:
+                        pass
 
                 # --- ЛОГИКА УВЕДОМЛЕНИЙ ---
 
@@ -148,7 +185,6 @@ def monitor_account(project_name: str):
 
                 is_detailed = True
                 try:
-                    # Пробуем получить настройки из Redis через writer, если он есть
                     if hasattr(bot_link, 'writer') and bot_link.writer:
                         val = bot_link.writer.get(f"settings:notify:{project_name}:success")
                         if val == "0": is_detailed = False
@@ -173,6 +209,10 @@ def monitor_account(project_name: str):
                     time.sleep(0.5)
                     bot_link.send_notification("worker_finished", finish_msg, project_override=project_name)
 
+                    # 🔥 ЧИСТИМ ЗА СОБОЙ ПОСЛЕ ФИНИША
+                    # Чтобы при следующем запуске (или цикле) статистика была чистой
+                    reset_global_stats()
+
                 return True
 
             except Exception as e:
@@ -186,7 +226,6 @@ def monitor_account(project_name: str):
                 is_finished = self.total_accounts > 0 and total_done >= self.total_accounts
                 final_status = "Working 🟢" if not is_finished else "Errors 🔴"
 
-                # Commit ошибок из буфера (безопасно)
                 try:
                     error_summary = bot_link.flush_temp_errors(project_name, self.address, fallback_error=str(e))
                 except:
@@ -203,7 +242,8 @@ def monitor_account(project_name: str):
                         }
                         error_stats.update(get_global_inventory())
                         status_manager.update_status(project_name, error_stats)
-                    except: pass
+                    except:
+                        pass
 
                 bot_link.send_notification("error", f"❌ <b>FAILED:</b> {self.address[:8]}...\n\n{error_summary}",
                                            project_override=project_name)
@@ -222,6 +262,9 @@ def monitor_account(project_name: str):
                     )
                     time.sleep(0.5)
                     bot_link.send_notification("worker_finished", finish_msg, project_override=project_name)
+
+                    # 🔥 ЧИСТИМ ЗА СОБОЙ ПРИ ОШИБКЕ В КОНЦЕ
+                    reset_global_stats()
 
                 return False
 

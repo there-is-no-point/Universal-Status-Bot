@@ -21,8 +21,6 @@ DEBUG_MODE = False
 ENABLE_HEARTBEAT = True
 
 # Настройка времени для ЭТОГО КОНКРЕТНОГО проекта
-# Например, для Hackquest ставим 3600 (1 час)
-# Для быстрых свапалок можно оставить 600 (10 мин)
 HEARTBEAT_THRESHOLD = 3600
 
 # ==========================================
@@ -56,8 +54,41 @@ class BotLink:
         self.progress_callback = None
         self.inventory_callback = None
         self.running = False
-        self.worker_name = getattr(config, 'WORKER_NAME', "Unknown_Worker")
         self.project_name = "UnknownProject"
+
+        # === 🔥 ЛОГИКА ИМЕНИ ВОРКЕРА (ИНТЕРАКТИВНАЯ) ===
+        default_name = getattr(config, 'WORKER_NAME', "Unknown_Worker")
+        self.worker_name = default_name
+
+        # 1. Если запуск через аргументы (для профи/батников) - приоритет высший
+        if "--worker" in sys.argv:
+            try:
+                idx = sys.argv.index("--worker")
+                if idx + 1 < len(sys.argv):
+                    self.worker_name = sys.argv[idx + 1].strip()
+            except:
+                pass
+
+        # 2. Если аргументов нет - спрашиваем у пользователя (для удобства)
+        else:
+            print(f"\n🤖 ---------------------------------------------------")
+            print(f"👋 Привет! Стандартное имя воркера: [{default_name}]")
+            print(f"💡 Если это второе окно (дейлики), введи приписку (например: Daily)")
+            try:
+                # Ждем ввода. Если нажать Enter, suffix будет пустым.
+                suffix = input("👉 Введите суффикс (или просто Enter для запуска): ").strip()
+                if suffix:
+                    # Если пользователь ввел "Daily", имя станет "Server_Daily"
+                    if not suffix.startswith("_") and not suffix.startswith("-"):
+                        suffix = "_" + suffix
+                    self.worker_name = f"{default_name}{suffix}"
+                    print(f"✅ Окей! Работаем под именем: [{self.worker_name}]")
+                else:
+                    print(f"🚀 Запускаем основу: [{self.worker_name}]")
+            except Exception:
+                pass
+            print(f"---------------------------------------------------\n")
+        # ===============================================
 
         self.last_action_time = time.time()
 
@@ -136,7 +167,7 @@ class BotLink:
 
         return short_msg
 
-    # === СБОР СТАТИСТИКИ (ТУТ ИЗМЕНЕНИЕ) ===
+    # === СБОР СТАТИСТИКИ ===
     def _extract_stats(self):
         if not self.active_client: return None
         c = self.active_client
