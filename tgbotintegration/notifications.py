@@ -156,7 +156,18 @@ class BotLink:
         if logs:
             last_log = logs[-1]
             parts = last_log.split(" | ")
-            if len(parts) >= 4:
+            # Format: TIMESTAMP | LEVEL | MODULE | [POS] | MSG
+            # Old Format: TIMESTAMP | LEVEL | MODULE | MSG
+            
+            module = "Unknown"
+            msg = last_log
+
+            if len(parts) >= 5: # New format with position
+                module = parts[2].strip()
+                # Part 3 is position, Part 4 is message
+                msg = parts[4].strip()
+                short_msg = f"<b>{module}:</b> {msg}"
+            elif len(parts) >= 4: # Old format or format without position
                 module = parts[2].strip()
                 msg = parts[3].strip()
                 short_msg = f"<b>{module}:</b> {msg}"
@@ -197,7 +208,6 @@ class BotLink:
             "status": status,
             "current_account": getattr(c, 'address', 'Unknown'),
             "last_updated": time.time(),
-            # 🔥 ВАЖНО: Мы сообщаем боту, какой у нас порог пульса
             "heartbeat_threshold": HEARTBEAT_THRESHOLD,
             "pos_current": getattr(c, 'position', 0),
             "pos_total": getattr(c, 'total_accounts', 0),
@@ -206,7 +216,9 @@ class BotLink:
         data.update(extra_stats)
         return data
 
-    def _send_log(self):
+    # 🔥 ПУБЛИЧНАЯ ФУНКЦИЯ ОТПРАВКИ ЛОГА
+    # (Бывшая _send_log, теперь доступна извне)
+    def upload_log(self):
         if not self.running: return
         self._mark_activity()
         try:
@@ -285,7 +297,8 @@ class BotLink:
                 if msg and msg['type'] == 'message':
                     data = msg['data']
                     if data == "get_log":
-                        threading.Thread(target=self._send_log).start()
+                        # 👇 ОБНОВЛЕНО: Используем публичный метод
+                        threading.Thread(target=self.upload_log).start()
                     elif data == "update_status":
                         stats = self._extract_stats()
                         if stats:

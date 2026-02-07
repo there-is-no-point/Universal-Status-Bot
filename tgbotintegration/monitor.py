@@ -93,7 +93,6 @@ def monitor_account(project_name: str):
             # ===============================================
 
             # === 🔥 ЛОГИКА АВТО-СБРОСА (SELF-CLEANING) ===
-            # Определяем, нужно ли сбросить статистику перед стартом
             current_pos = getattr(self, 'position', 0)
             _, _, current_total_done = get_progress_data()
 
@@ -104,21 +103,19 @@ def monitor_account(project_name: str):
             is_overflow = (self.total_accounts > 0 and current_total_done >= self.total_accounts)
 
             if is_start_of_cycle or is_overflow:
-                # Сбрасываем только если есть старые данные
                 if current_total_done > 0:
                     reset_global_stats()
             # ===============================================
 
             bot_link.register_client(
                 self,
-                project_name=project_name,  # 🔥 Раскомментировал! Это нужно для работы Heartbeat
+                project_name=project_name,
                 progress_callback=lambda: get_progress_string(self.total_accounts),
                 inventory_callback=get_global_inventory
             )
 
             progress_str = get_progress_string(self.total_accounts)
 
-            # Безопасная отправка в Redis
             if status_manager:
                 try:
                     start_stats = {
@@ -173,8 +170,6 @@ def monitor_account(project_name: str):
                     except:
                         pass
 
-                # --- ЛОГИКА УВЕДОМЛЕНИЙ ---
-
                 msg = f"Аккаунт {self.address[:6]}... завершен!\n"
                 msg += f"📊 <b>Stats:</b> {final_progress}\n"
                 inventory_lines = []
@@ -209,8 +204,12 @@ def monitor_account(project_name: str):
                     time.sleep(0.5)
                     bot_link.send_notification("worker_finished", finish_msg, project_override=project_name)
 
-                    # 🔥 ЧИСТИМ ЗА СОБОЙ ПОСЛЕ ФИНИША
-                    # Чтобы при следующем запуске (или цикле) статистика была чистой
+                    # 🔥 АВТО-ОТПРАВКА ЛОГА ПРИ УСПЕХЕ (ЕСЛИ ВКЛЮЧЕНО В КОНФИГЕ)
+                    # По умолчанию: False (не спамить)
+                    if getattr(config, 'SEND_LOG_ON_SUCCESS', False):
+                        bot_link.upload_log()
+                        time.sleep(1)
+
                     reset_global_stats()
 
                 return True
@@ -263,7 +262,12 @@ def monitor_account(project_name: str):
                     time.sleep(0.5)
                     bot_link.send_notification("worker_finished", finish_msg, project_override=project_name)
 
-                    # 🔥 ЧИСТИМ ЗА СОБОЙ ПРИ ОШИБКЕ В КОНЦЕ
+                    # 🔥 АВТО-ОТПРАВКА ЛОГА ПРИ ОШИБКЕ (ЕСЛИ ВКЛЮЧЕНО В КОНФИГЕ)
+                    # По умолчанию: True (нужно видеть ошибки)
+                    if getattr(config, 'SEND_LOG_ON_ERROR', True):
+                        bot_link.upload_log()
+                        time.sleep(1)
+
                     reset_global_stats()
 
                 return False
